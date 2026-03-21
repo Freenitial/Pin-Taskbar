@@ -32,7 +32,7 @@ This tool writes directly to the taskbar's internal data structures with proper 
 | File | Format | Use case |
 |---|---|---|
 | `Pin-Taskbar.ps1` | Standalone PowerShell script | Command-line / deployment / GPO logon scripts. Supports `-LogFile` and returns exit codes. |
-| `Pin-Taskbar.bat` | Batch/PowerShell hybrid | Same as above, but bypasses PowerShell execution policy restrictions. |
+| `Pin-Taskbar.bat` | Standalone Batch/PowerShell hybrid | Same as above, but bypasses PowerShell execution policy restrictions. |
 | `Set-TaskbarPin.ps1` | PowerShell function | Compact. Import into modules, call/integrate in other scripts. |
 
 ## Usage
@@ -94,13 +94,13 @@ Set-TaskbarPin "C:\Windows\System32\main.cpl" -Silent
 
 ## Parameters
 
-| Parameter | `.ps1` / `.bat` | Function | Description |
-|---|---|---|---|
-| `-Pin` | Yes | Yes | Path(s) to pin. Supports `.lnk`, `.exe`, `.msc`, `.cpl`, UWP AUMIDs, directories. Semicolon-delimited. |
-| `-Unpin` | Yes | Yes | Switch. Turns `-Pin` into a match pattern for removal. |
-| `-Silent` | Yes | Yes | Suppresses console output. |
-| `-LogFile` | Yes | No | Path to a `.txt` or `.log` file for detailed logging. |
-| `-AllUsers` | Yes | Yes | Applies operation to all user profiles. Requires elevation. |
+| Parameter | Description |
+|---|---|
+| `-Pin` | Path(s) to pin. Supports `.lnk`, `.exe`, `.msc`, `.cpl`, UWP AUMIDs, directories. Semicolon-delimited. |
+| `-Unpin` | Switch. Turns `-Pin` into a match pattern for removal. |
+| `-Silent` | Suppresses console output. |
+| `-LogFile` | Path to a `.txt` or `.log` file for detailed logging. Standalone scripts only. |
+| `-AllUsers` | Applies operation to all user profiles. Requires elevation. |
 
 ## Exit codes (standalone script and .bat only)
 
