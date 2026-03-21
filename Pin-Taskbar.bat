@@ -17,7 +17,7 @@
     
     :: PowerShell self-read, skipping batch part
     if defined help (
-        %powershell% -NoLogo -NoProfile -Command "$n=[IO.Path]::GetFileName('%~f0');$sb=[ScriptBlock]::Create([IO.File]::ReadAllText('%~f0'));Set-Item function:$n $sb;Get-Help $n -Full" 
+        %powershell% -NoLogo -NoProfile -Command "$n=[IO.Path]::GetFileName('%~f0');$sb=[ScriptBlock]::Create([IO.File]::ReadAllText('%~f0'));Set-Item function:$n $sb;Get-Help $n" 
         pause & endlocal & exit /b
     )
     %powershell% -NoLogo -NoProfile -Command "Set-Location $([IO.Path]::GetDirectoryName('%~f0'));$sb=[ScriptBlock]::Create([IO.File]::ReadAllText('%~f0'));& $sb @args" %args%
