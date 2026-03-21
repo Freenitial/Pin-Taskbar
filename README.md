@@ -10,7 +10,7 @@ Tested **from Windows Vista to Windows 11 25H2** (Build 26200+).
 
 Every other taskbar pin tool either:
 - Uses `InvokeVerb('taskbarpin')` - disabled by Microsoft a long time ago
-- Uses `IPinnedList3` COM - stubbed on recent Windows versions
+- Uses `shell:::{4234d49b-0245-4df3-b780-3893943456e1}` COM - stubbed since Windows 10 21H2
 - Uses UI automation / `SendKeys` - fragile, locale-dependent, unreliable
 - Modifies `LayoutModification.xml` - requires an `explorer.exe` restart to take effect
 
