@@ -33,7 +33,7 @@ This tool writes directly to the taskbar's internal data structures with proper 
 |---|---|---|
 | `Pin-Taskbar.ps1` | Standalone PowerShell script | Command-line / deployment / GPO logon scripts. Supports `-LogFile` and returns exit codes. |
 | `Pin-Taskbar.bat` | Batch/PowerShell hybrid | Same as above, but bypasses PowerShell execution policy restrictions. |
-| `Set-TaskbarPin.ps1` | PowerShell function | Import into modules, call/integrate in other scripts. |
+| `Set-TaskbarPin.ps1` | PowerShell function | Compact. Import into modules, call/integrate in other scripts. |
 
 ## Usage
 
