@@ -27,7 +27,7 @@
 <#
 .SYNOPSIS
     Pin or unpin shortcuts from the Windows taskbar programmatically.
-    Version 1.1
+    Version 1.2
 .DESCRIPTION
     Pins or unpins items to/from the Windows taskbar across all windows versions.
 
@@ -389,7 +389,8 @@ public class TaskbarPin {
     // Many shell COM operations require an STA (Single-Threaded Apartment) thread.
     // PowerShell runs in MTA by default. This generic wrapper spawns a dedicated
     // STA thread when needed, runs the operation there, and joins back.
-    static T RunOnSTA<T>(Func<T> fn) {
+    delegate T StaFunc<T>();
+    static T RunOnSTA<T>(StaFunc<T> fn) {
         if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA) return fn();
         T r = default(T);
         Thread t = new Thread(delegate() { r = fn(); });
@@ -572,14 +573,14 @@ public class TaskbarPin {
     // Public entry point using SHParseDisplayName (namespace PIDLs).
     // Produces PIDLs natively accepted by the taskbar handler.
     public static byte[] GetBlobEntryEx(string lnkFullPath, string beef001dContent) {
-        return RunOnSTA(() => GetBlobEntryInternal(lnkFullPath, beef001dContent, false));
+        return RunOnSTA<byte[]>(delegate() { return GetBlobEntryInternal(lnkFullPath, beef001dContent, false); });
     }
 
     // Public entry point using ILCreateFromPathW (filesystem PIDLs).
     // Used in AllUsers mode where SHParseDisplayName cannot resolve
     // paths under another user's profile.
     public static byte[] GetBlobEntryFs(string lnkFullPath, string beef001dContent) {
-        return RunOnSTA(() => GetBlobEntryInternal(lnkFullPath, beef001dContent, true));
+        return RunOnSTA<byte[]>(delegate() { return GetBlobEntryInternal(lnkFullPath, beef001dContent, true); });
     }
 
     //===========================================================
@@ -726,7 +727,7 @@ public class TaskbarPin {
     // Resolves the AUMID to a PIDL via shell:AppsFolder, sets PKEY_AppUserModel_ID,
     // and saves the .lnk via IPersistFile.
     public static bool CreateAppShortcut(string aumid, string lnkPath) {
-        return RunOnSTA(() => {
+        return RunOnSTA<bool>(delegate() {
             IntPtr pidl = ParseDisplayName("shell:AppsFolder\\" + aumid);
             if (pidl == IntPtr.Zero) return false;
             try { return CreateShortcutFromPidl(pidl, lnkPath, aumid); }
@@ -737,7 +738,7 @@ public class TaskbarPin {
     // Creates a .lnk shortcut from a shell display name (e.g. a Control Panel item path).
     // The appUserModelId parameter is stored as the AUMID property on the shortcut.
     public static bool CreatePidlShortcut(string displayName, string lnkPath, string appUserModelId) {
-        return RunOnSTA(() => {
+        return RunOnSTA<bool>(delegate() {
             IntPtr pidl; uint sfgao;
             if (SHParseDisplayName(displayName, IntPtr.Zero, out pidl, 0, out sfgao) != 0 || pidl == IntPtr.Zero) return false;
             try { return CreateShortcutFromPidl(pidl, lnkPath, appUserModelId); }
@@ -752,7 +753,7 @@ public class TaskbarPin {
     // Reads the PKEY_AppUserModel_ID (AUMID) from an existing .lnk file.
     // Returns empty string if the property is not set.
     public static string GetAumid(string lnkPath) {
-        return RunOnSTA(() => {
+        return RunOnSTA<string>(delegate() {
             Guid cls = CLSID_ShellLink; Guid iid = IID_IShellLinkW; IntPtr psl;
             if (CoCreateInstance(ref cls, IntPtr.Zero, 1, ref iid, out psl) != 0) return "";
             IntPtr vtLink = Marshal.ReadIntPtr(psl);
@@ -1206,7 +1207,7 @@ if ($Unpin) {
                         Write-Log "  [pattern] CPL '$InputItem' could not be resolved via namespace -- falling back to '$FallbackPattern'" 'Yellow'
                     }
                 }
-                elseif ($InputExtension -in '.msc', '.exe') {
+                elseif ($InputExtension -eq '.msc' -or $InputExtension -eq '.exe') {
                     # .msc and .exe items are pinned under their filename without extension
                     # (e.g. "services.msc" becomes "services.lnk" in the TaskBar directory)
                     $StrippedPattern = [IO.Path]::GetFileNameWithoutExtension($InputItem)
