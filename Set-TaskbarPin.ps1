@@ -1,5 +1,5 @@
 function Set-TaskbarPin {
-    # Version 1.1
+    # Version 1.2
     <#
         .EXAMPLE
         Set-TaskbarPin "C:\Users\John\Desktop\MyApp.lnk"
@@ -128,7 +128,7 @@ public class TaskbarPin {
     static readonly Guid IID_IPropertyStore = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99");
     static readonly Guid IID_IPersistFile = new Guid("0000010B-0000-0000-C000-000000000046");
     static readonly Guid FMTID_AppUserModel = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
-    static T RunOnSTA<T>(Func<T> fn) { if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA) return fn(); T r = default(T); Thread t = new Thread(delegate() { r = fn(); }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join(); return r; }
+    delegate T StaFunc<T>(); static T RunOnSTA<T>(StaFunc<T> fn) { if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA) return fn(); T r = default(T); Thread t = new Thread(delegate() { r = fn(); }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join(); return r; }
     static T Vtbl<T>(IntPtr vtbl, int slot) where T : class { return (T)(object)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(vtbl, slot * IntPtr.Size), typeof(T)); }
     static void Release(IntPtr ppv) { Vtbl<FnRelease>(Marshal.ReadIntPtr(ppv), 2)(ppv); }
     static void Release(IntPtr ppv, IntPtr vtbl) { Vtbl<FnRelease>(vtbl, 2)(ppv); }
@@ -196,8 +196,8 @@ public class TaskbarPin {
         if (pidl == IntPtr.Zero) return null;
         try { return BuildBlobEntry(pidl, beef001dContent); } finally { ILFree(pidl); }
     }
-    public static byte[] GetBlobEntryEx(string lnkFullPath, string beef001dContent) { return RunOnSTA(() => GetBlobEntryInternal(lnkFullPath, beef001dContent, false)); }
-    public static byte[] GetBlobEntryFs(string lnkFullPath, string beef001dContent) { return RunOnSTA(() => GetBlobEntryInternal(lnkFullPath, beef001dContent, true)); }
+    public static byte[] GetBlobEntryEx(string lnkFullPath, string beef001dContent) { return RunOnSTA<byte[]>(delegate() { return GetBlobEntryInternal(lnkFullPath, beef001dContent, false); }); }
+    public static byte[] GetBlobEntryFs(string lnkFullPath, string beef001dContent) { return RunOnSTA<byte[]>(delegate() { return GetBlobEntryInternal(lnkFullPath, beef001dContent, true); }); }
     static bool CreateShortcutFromPidl(IntPtr pidl, string lnkPath, string aumid) {
         Guid cls = CLSID_ShellLink; Guid iid = IID_IShellLinkW; IntPtr psl;
         if (CoCreateInstance(ref cls, IntPtr.Zero, 1, ref iid, out psl) != 0) return false;
@@ -206,13 +206,13 @@ public class TaskbarPin {
         finally { Release(psl, vtLink); }
     }
     public static bool CreateAppShortcut(string aumid, string lnkPath) {
-        return RunOnSTA(() => { IntPtr pidl = ParseDisplayName("shell:AppsFolder\\" + aumid); if (pidl == IntPtr.Zero) return false; try { return CreateShortcutFromPidl(pidl, lnkPath, aumid); } finally { ILFree(pidl); } });
+        return RunOnSTA<bool>(delegate() { IntPtr pidl = ParseDisplayName("shell:AppsFolder\\" + aumid); if (pidl == IntPtr.Zero) return false; try { return CreateShortcutFromPidl(pidl, lnkPath, aumid); } finally { ILFree(pidl); } });
     }
     public static bool CreatePidlShortcut(string displayName, string lnkPath, string appUserModelId) {
-        return RunOnSTA(() => { IntPtr pidl; uint sfgao; if (SHParseDisplayName(displayName, IntPtr.Zero, out pidl, 0, out sfgao) != 0 || pidl == IntPtr.Zero) return false; try { return CreateShortcutFromPidl(pidl, lnkPath, appUserModelId); } finally { ILFree(pidl); } });
+        return RunOnSTA<bool>(delegate() { IntPtr pidl; uint sfgao; if (SHParseDisplayName(displayName, IntPtr.Zero, out pidl, 0, out sfgao) != 0 || pidl == IntPtr.Zero) return false; try { return CreateShortcutFromPidl(pidl, lnkPath, appUserModelId); } finally { ILFree(pidl); } });
     }
     public static string GetAumid(string lnkPath) {
-        return RunOnSTA(() => {
+        return RunOnSTA<string>(delegate() {
             Guid cls = CLSID_ShellLink; Guid iid = IID_IShellLinkW; IntPtr psl;
             if (CoCreateInstance(ref cls, IntPtr.Zero, 1, ref iid, out psl) != 0) return "";
             IntPtr vtLink = Marshal.ReadIntPtr(psl);
@@ -510,7 +510,7 @@ public class TaskbarPin {
                         }
                         if (-not $CplHandled) { $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem) }
                     }
-                    elseif ($InputExtension -in '.msc', '.exe') {
+                    elseif ($InputExtension -eq '.msc' -or $InputExtension -eq '.exe') {
                         $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem)
                     }
                     else { $UnpinMatchPatterns += $InputItem }
