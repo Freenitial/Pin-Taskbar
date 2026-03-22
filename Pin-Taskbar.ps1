@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Pin or unpin shortcuts from the Windows taskbar programmatically.
-    Version 1.0
+    Version 1.1
 .DESCRIPTION
     Pins or unpins items to/from the Windows taskbar across all windows versions.
 
@@ -129,15 +129,15 @@ if ($InteractiveSessionUserSID -and $InteractiveSessionUserSID -ne $CurrentUserS
     if ($ProfileListKey) {
         $InteractiveUserProfilePath = $ProfileListKey.GetValue('ProfileImagePath', '')
         $ProfileListKey.Close()
+        $TaskBarPinnedDirectory     = [IO.Path]::Combine($InteractiveUserProfilePath, $TaskBarRelativeProfilePath)
+        $QuickLaunchDirectory       = [IO.Path]::Combine($InteractiveUserProfilePath, 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch')
+        $TaskBarDirectoryExists     = [IO.Directory]::Exists($TaskBarPinnedDirectory)
+        $QuickLaunchDirectoryExists = [IO.Directory]::Exists($QuickLaunchDirectory)
+        $TaskBandRegistryKeyExists  = $false
+        $CrossUserRegistryProbe = [Microsoft.Win32.Registry]::Users.OpenSubKey("$InteractiveSessionUserSID\$TaskBandRegistrySubKey", $false)
+        if ($CrossUserRegistryProbe) { $TaskBandRegistryKeyExists = $true; $CrossUserRegistryProbe.Close() }
+        $DirectBlobWriteIsSupported = $TaskBarDirectoryExists -and $TaskBandRegistryKeyExists
     }
-    $TaskBarPinnedDirectory     = [IO.Path]::Combine($InteractiveUserProfilePath, $TaskBarRelativeProfilePath)
-    $QuickLaunchDirectory       = [IO.Path]::Combine($InteractiveUserProfilePath, 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch')
-    $TaskBarDirectoryExists     = [IO.Directory]::Exists($TaskBarPinnedDirectory)
-    $QuickLaunchDirectoryExists = [IO.Directory]::Exists($QuickLaunchDirectory)
-    $TaskBandRegistryKeyExists  = $false
-    $CrossUserRegistryProbe = [Microsoft.Win32.Registry]::Users.OpenSubKey("$InteractiveSessionUserSID\$TaskBandRegistrySubKey", $false)
-    if ($CrossUserRegistryProbe) { $TaskBandRegistryKeyExists = $true; $CrossUserRegistryProbe.Close() }
-    $DirectBlobWriteIsSupported = $TaskBarDirectoryExists -and $TaskBandRegistryKeyExists
 }
 
 
@@ -149,6 +149,7 @@ if ($InteractiveSessionUserSID -and $InteractiveSessionUserSID -ne $CurrentUserS
 #   3. Write-Banner   : colored status banners (PIN/UNPIN/OK/FAIL) to both console and log file
 
 $LogFileStreamWriter = $null
+$script:SuppressLogToConsole = $false
 if ($LogFile) {
     $LogFileParentDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath([IO.Path]::Combine($PWD.ProviderPath, $LogFile)))
     if ($LogFileParentDirectory -and -not [IO.Directory]::Exists($LogFileParentDirectory)) {
@@ -162,7 +163,7 @@ function Write-Log {
     param([string]$Message, [string]$Color = 'Gray')
     $FormattedTimestamp = [DateTime]::Now.ToString('HH:mm:ss.fff')
     $FormattedLogLine  = "[$FormattedTimestamp] $Message"
-    if (-not $Silent) { Write-Host $FormattedLogLine -ForegroundColor $Color }
+    if (-not $Silent -and -not $script:SuppressLogToConsole) { Write-Host $FormattedLogLine -ForegroundColor $Color }
     if ($LogFileStreamWriter) { $LogFileStreamWriter.WriteLine($FormattedLogLine) }
 }
 
@@ -170,9 +171,10 @@ function Write-Console {
     param([string]$Message, [string]$Color = 'White', [switch]$NoNewline, [string]$BackgroundColor)
     if ($Silent) { return }
     $WriteHostParams = @{ Object = $Message; ForegroundColor = $Color }
-    if ($NoNewline)       { $WriteHostParams['NoNewline']       = $true }
+    if ($NoNewline)       { $WriteHostParams['NoNewline'] = $true; $script:SuppressLogToConsole = $true }
     if ($BackgroundColor) { $WriteHostParams['BackgroundColor'] = $BackgroundColor }
     Write-Host @WriteHostParams
+    if (-not $NoNewline)  { $script:SuppressLogToConsole = $false }
 }
 
 function Write-Banner {
@@ -530,25 +532,28 @@ public class TaskbarPin {
         return result;
     }
 
+    // Shared PIDL acquisition and blob entry construction.
+    // useFilesystem = true  -> ILCreateFromPathW    (filesystem PIDL, used in AllUsers mode)
+    // useFilesystem = false -> SHParseDisplayName   (namespace PIDL, used for current user)
+    static byte[] GetBlobEntryInternal(string path, string beef001dContent, bool useFilesystem) {
+        IntPtr pidl;
+        if (useFilesystem) { pidl = ILCreateFromPathW(path); }
+        else { uint sfgao; if (SHParseDisplayName(path, IntPtr.Zero, out pidl, 0, out sfgao) != 0) pidl = IntPtr.Zero; }
+        if (pidl == IntPtr.Zero) return null;
+        try { return BuildBlobEntry(pidl, beef001dContent); } finally { ILFree(pidl); }
+    }
+
     // Public entry point using SHParseDisplayName (namespace PIDLs).
     // Produces PIDLs natively accepted by the taskbar handler.
     public static byte[] GetBlobEntryEx(string lnkFullPath, string beef001dContent) {
-        return RunOnSTA(() => {
-            IntPtr pidl; uint sfgao;
-            if (SHParseDisplayName(lnkFullPath, IntPtr.Zero, out pidl, 0, out sfgao) != 0 || pidl == IntPtr.Zero) return null;
-            try { return BuildBlobEntry(pidl, beef001dContent); } finally { ILFree(pidl); }
-        });
+        return RunOnSTA(() => GetBlobEntryInternal(lnkFullPath, beef001dContent, false));
     }
 
     // Public entry point using ILCreateFromPathW (filesystem PIDLs).
     // Used in AllUsers mode where SHParseDisplayName cannot resolve
     // paths under another user's profile.
     public static byte[] GetBlobEntryFs(string lnkFullPath, string beef001dContent) {
-        return RunOnSTA(() => {
-            IntPtr pidl = ILCreateFromPathW(lnkFullPath);
-            if (pidl == IntPtr.Zero) return null;
-            try { return BuildBlobEntry(pidl, beef001dContent); } finally { ILFree(pidl); }
-        });
+        return RunOnSTA(() => GetBlobEntryInternal(lnkFullPath, beef001dContent, true));
     }
 
     //===========================================================
@@ -589,6 +594,28 @@ public class TaskbarPin {
             CloseHandle(_mutexHandle);
             _mutexHandle = IntPtr.Zero;
         }
+    }
+
+    //===========================================================
+    //  SHChangeNotify -- per-item update and synchronous flush
+    //===========================================================
+
+    // Sends SHCNE_UPDATEITEM (0x2000) with SHCNF_PATHW (0x0005) for a single .lnk.
+    // Triggers the UPDATEITEM handler which calls ItemChangeNotify -> SavePinList
+    // to normalize the entry.
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern void SHChangeNotify(int wEventId, uint uFlags, string dwItem1, IntPtr dwItem2);
+
+    public static void SHChangeNotifyUpdateItem(string path) {
+        SHChangeNotify(0x2000, 0x0005, path, IntPtr.Zero);
+    }
+
+    // Flushes pending shell change notifications synchronously.
+    // SHCNF_FLUSH (0x1000) blocks until all queued events are processed.
+    // Called between batches of 9 UPDATEITEM notifications to stay under
+    // the shell coalescing threshold.
+    public static void SHChangeNotifyDrain() {
+        SHChangeNotify(0, 0x1000, IntPtr.Zero, IntPtr.Zero);
     }
 
     //===========================================================
@@ -747,7 +774,7 @@ public class TaskbarPin {
 function Open-EffectiveTaskbandKey {
     param([bool]$Writable = $false)
     if ($IsRunningCrossUser) {
-        return [Microsoft.Win32.Registry]::Users.OpenSubKey("$InteractiveSessionUserSID\$TaskBandRegistrySubKey", $Writable)
+        return [Microsoft.Win32.Registry]::Users.OpenSubKey("$EffectivePrimaryUserSID\$TaskBandRegistrySubKey", $Writable)
     }
     return [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($TaskBandRegistrySubKey, $Writable)
 }
@@ -880,7 +907,6 @@ function New-TargetShortcut {
                 return $CplTemporaryLnkPath
             }
         }
-        Write-Log "  [!] CPL not found in Control Panel namespace, fallback to filesystem shortcut" -Color Yellow
     }
     # Non-.lnk inputs : create a temporary shortcut in %TEMP%
     $ShortcutDisplayName = [IO.Path]::GetFileNameWithoutExtension($ResolvedTargetPath)
@@ -1713,6 +1739,21 @@ if ($DirectBlobWriteIsSupported) {
         Write-Console "  [*] AllUsers : $AllUsersProfilesUpdatedCount profile(s) updated" -Color DarkCyan
         Write-Log "[allUsers] $AllUsersProfilesUpdatedCount profile(s) updated"
         Write-Console ""
+    }
+
+    # When >=10 items are added, the shell coalesces SHCNE_UPDATEITEM events
+    # preventing per-item normalization. Fix: re-send UPDATEITEM in batches
+    # of 9 (under the coalescing threshold) with sync drains between batches.
+    if ($BlobEntriesAddedCount -ge 10) {
+        [TaskbarPin]::SHChangeNotifyDrain()
+        for ($NormIdx = 0; $NormIdx -lt $BlobEntriesReadyForInjection.Count; $NormIdx += 9) {
+            $NormEnd = [Math]::Min($NormIdx + 9, $BlobEntriesReadyForInjection.Count)
+            for ($NormJ = $NormIdx; $NormJ -lt $NormEnd; $NormJ++) {
+                [TaskbarPin]::SHChangeNotifyUpdateItem($BlobEntriesReadyForInjection[$NormJ].DestinationLnkPath)
+            }
+            [TaskbarPin]::SHChangeNotifyDrain()
+        }
+        Write-Log "  [fix] Normalization triggered for $($BlobEntriesReadyForInjection.Count) items (batches of 9)"
     }
 
     $RemainingPinTargets = @($ItemsDeferredToQuickLaunch)
