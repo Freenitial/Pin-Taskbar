@@ -1,18 +1,18 @@
 function Set-TaskbarPin {
-    # Version 1.0
+    # Version 1.1
     <#
-    .EXAMPLE
-      Set-TaskbarPin "C:\Users\John\Desktop\MyApp.lnk"
-      Set-TaskbarPin "C:\Windows\regedit.exe;C:\MyFolder" -AllUsers
-      Set-TaskbarPin "shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
-      Set-TaskbarPin "uwp:Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
-      Set-TaskbarPin "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
-      Set-TaskbarPin "C:\App1.lnk;C:\App2.lnk;C:\App3.exe"
-      Set-TaskbarPin "notepad" 
-      Set-TaskbarPin "C:\Tools\*.exe"
-      Set-TaskbarPin -Unpin "Notepad*" -AllUsers
-      Set-TaskbarPin "C:\MyApp.lnk" -Silent
-      Set-TaskbarPin "C:\Windows\System32\services.msc;C:\Windows\System32\main.cpl"
+        .EXAMPLE
+        Set-TaskbarPin "C:\Users\John\Desktop\MyApp.lnk"
+        Set-TaskbarPin "C:\Windows\regedit.exe;C:\MyFolder" -AllUsers
+        Set-TaskbarPin "shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        Set-TaskbarPin "uwp:Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        Set-TaskbarPin "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        Set-TaskbarPin "C:\App1.lnk;C:\App2.lnk;C:\App3.exe"
+        Set-TaskbarPin "notepad" 
+        Set-TaskbarPin "C:\Tools\*.exe"
+        Set-TaskbarPin -Unpin "Notepad*" -AllUsers
+        Set-TaskbarPin "C:\MyApp.lnk" -Silent
+        Set-TaskbarPin "C:\Windows\System32\services.msc;C:\Windows\System32\main.cpl"
     #>
     param(
         [Parameter(Position = 0)]
@@ -22,6 +22,7 @@ function Set-TaskbarPin {
         [Alias('Everyone', 'All')]      [switch]$AllUsers
     )
     $ErrorActionPreference = 'Stop'
+    $script:SuppressConsoleNewlines = $false
     #region ENVIRONMENT
     $RoamingAppDataPath              = [Environment]::GetFolderPath('ApplicationData')
     $TaskBarPinnedDirectory          = [IO.Path]::Combine($RoamingAppDataPath, 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar')
@@ -70,9 +71,9 @@ function Set-TaskbarPin {
     #region LOGGING
     function Write-Console {
         param([string]$Message, [string]$Color = 'White', [switch]$NoNewline)
-        if ($Silent) { return }
+        if ($Silent -or $script:SuppressConsoleOutput) { return }
         $WriteHostParams = @{ Object = $Message; ForegroundColor = $Color }
-        if ($NoNewline)       { $WriteHostParams['NoNewline']       = $true }
+        if ($NoNewline) { $WriteHostParams['NoNewline'] = $true }
         Write-Host @WriteHostParams
     }
     function Write-Banner {
@@ -242,12 +243,15 @@ public class TaskbarPin {
         if (r == 0 || r == 0x80) { _mutexHandle = h; return true; } CloseHandle(h); return false;
     }
     public static void ReleasePinMutex() { if (_mutexHandle != IntPtr.Zero) { ReleaseMutex(_mutexHandle); CloseHandle(_mutexHandle); _mutexHandle = IntPtr.Zero; } }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]static extern void SHChangeNotify(int wEventId, uint uFlags, string dwItem1, IntPtr dwItem2);
+    public static void SHChangeNotifyUpdateItem(string path) { SHChangeNotify(0x2000, 0x0005, path, IntPtr.Zero); }
+    public static void SHChangeNotifyDrain() { SHChangeNotify(0, 0x1000, IntPtr.Zero, IntPtr.Zero); }
     public static int FindBlobEntry(byte[] blob, string filename) {
         byte[] needle = System.Text.Encoding.Unicode.GetBytes(filename); int pos = 0; int idx = 0;
         while (pos < blob.Length && blob[pos] != 0xFF) {
             if (pos + 5 > blob.Length) break; uint pidlSize = BitConverter.ToUInt32(blob, pos + 1);
             int pidlStart = pos + 5; int pidlEnd = pidlStart + (int)pidlSize; if (pidlEnd > blob.Length) break;
-            for (int b = pidlStart; b + needle.Length <= pidlEnd; b += 2) { bool match = true; for (int c = 0; c < needle.Length; c++) { if (blob[b + c] != needle[c]) { match = false; break; } } if (match) return idx; }
+            for (int b = pidlStart; b + needle.Length <= pidlEnd; b++) { bool match = true; for (int c = 0; c < needle.Length; c++) { if (blob[b + c] != needle[c]) { match = false; break; } } if (match) return idx; }
             pos = pidlEnd; idx++;
         } return -1;
     }
@@ -417,7 +421,6 @@ public class TaskbarPin {
         $RegistryKeyHandle.SetValue('Favorites',        $FinalBlobBytes,                       $BinaryRegistryValueKind)
         $RegistryKeyHandle.SetValue('FavoritesVersion',  3,                                    $DwordRegistryValueKind)
         $RegistryKeyHandle.SetValue('FavoritesChanges', ($CurrentFavoritesChangesCounter + 1), $DwordRegistryValueKind)
-        Write-Console "  [blob] $($ExistingFavoritesBlob.Length) -> $($FinalBlobBytes.Length) bytes (+$NumberOfEntriesActuallyAdded) | FavChanges : $CurrentFavoritesChangesCounter -> $($CurrentFavoritesChangesCounter + 1)" -Color DarkGray
         return $NumberOfEntriesActuallyAdded
     }
     function Get-UserProfiles {
@@ -567,7 +570,6 @@ public class TaskbarPin {
                 if ($FavoritesResolveBlob) { $RegistryKeyHandle.SetValue('FavoritesResolve', ([byte[]]$FavoritesResolveBlob), $BinaryRegistryValueKind) }
                 $RegistryKeyHandle.SetValue('FavoritesVersion',  3,                                $DwordRegistryValueKind)
                 $RegistryKeyHandle.SetValue('FavoritesChanges', ($CurrentFavoritesChanges + 1),    $DwordRegistryValueKind)
-                Write-Console "  [blob] Removed $($EntriesToRemove.Count) entries | FavChanges : $CurrentFavoritesChanges -> $($CurrentFavoritesChanges + 1)" -Color DarkGray
             }
             return $EntriesToRemove.Count
         }
@@ -670,6 +672,7 @@ public class TaskbarPin {
     $ItemsDeferredToQuickLaunch   = @()
     if ($DirectBlobWriteIsSupported) {
         Write-Console "  [>] Preparing blob entries ($($ResolvedPinTargets.Count) item(s))..." -Color DarkGray -NoNewline
+        $script:SuppressConsoleOutput = $true
         Initialize-NativeHelper
         $WshShellForPinCreation = $null
         foreach ($PinTarget in $ResolvedPinTargets) {
@@ -733,6 +736,7 @@ public class TaskbarPin {
                 } finally { $TaskBandRegistryKey.Close() }
             } finally { if ($MutexWasAcquired) { [TaskbarPin]::ReleasePinMutex() } }
             if ($BlobEntriesAddedCount -gt 0) { [TaskbarPin]::SendPinNotify() }
+            $script:SuppressConsoleOutput = $false
             Write-Console " done" -Color Green
             foreach ($ReadyEntry in $BlobEntriesReadyForInjection) {
                 Write-Console "  [+] $($ReadyEntry.DisplayName)" -Color Cyan
@@ -740,7 +744,7 @@ public class TaskbarPin {
                 if ($ReadyEntry.ShortcutIsTemporary -and $ReadyEntry.SourceShortcutPath) { try { [IO.File]::Delete($ReadyEntry.SourceShortcutPath) } catch { } }
             }
             Write-Console ""
-        } else { Write-Console " nothing to inject" -Color Yellow; Write-Console "" }
+    } else { $script:SuppressConsoleOutput = $false; Write-Console " nothing to inject" -Color Yellow; Write-Console "" }
         if ($AllUsers -and $BlobEntriesReadyForInjection.Count -gt 0) {
             $AllUserProfiles = @(Get-UserProfiles); $AllUsersProfilesUpdatedCount = 0
             foreach ($UserProfile in $AllUserProfiles) {
@@ -766,6 +770,17 @@ public class TaskbarPin {
                 if ($OfflineHiveResult) { $AllUsersProfilesUpdatedCount++ }
             }
             Write-Console "  [*] AllUsers : $AllUsersProfilesUpdatedCount profile(s) updated" -Color DarkCyan; Write-Console ""
+        }
+        if ($BlobEntriesAddedCount -ge 10) {
+            [TaskbarPin]::SHChangeNotifyDrain()
+            for ($NormIdx = 0; $NormIdx -lt $BlobEntriesReadyForInjection.Count; $NormIdx += 9) {
+                $NormEnd = [Math]::Min($NormIdx + 9, $BlobEntriesReadyForInjection.Count)
+                for ($NormItem = $NormIdx; $NormItem -lt $NormEnd; $NormItem++) {
+                    [TaskbarPin]::SHChangeNotifyUpdateItem($BlobEntriesReadyForInjection[$NormItem].DestinationLnkPath)
+                }
+                [TaskbarPin]::SHChangeNotifyDrain()
+            }
+            Write-Console "  [fix] Normalization triggered for $($BlobEntriesReadyForInjection.Count) items" -Color DarkGray
         }
         $RemainingPinTargets = @($ItemsDeferredToQuickLaunch)
     } else { $RemainingPinTargets = @($ResolvedPinTargets) }
