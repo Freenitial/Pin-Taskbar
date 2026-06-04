@@ -1,14 +1,15 @@
 <#
 .SYNOPSIS
     Pin or unpin shortcuts from the Windows taskbar programmatically.
-    Version 1.2
+    Version 1.3
 .DESCRIPTION
     Pins or unpins items to/from the Windows taskbar across all windows versions.
 
     PIN strategy :
       - Modern (Win7+) : writes a binary blob entry with a BEEF001D extension block
-        directly into the Taskband registry, then notifies the taskbar via SHChangeNotify.
-        This is the only reliable method on Windows 11 where COM pin APIs are stubbed out.
+        directly into the Taskband registry
+        (This is the only reliable method on Windows 11 where COM pin APIs are stubbed out.),
+        then notifies the taskbar by posting 0x446 to its pinned-items band.
       - Legacy (Vista)  : copies a .lnk shortcut into the Quick Launch directory.
 
     UNPIN strategy :
@@ -214,8 +215,8 @@ if ($ParsedInputItems.Count -eq 0) {
 # "Microsoft.Calculator_8wekyb3d8bbwe!App"      -> "shell:AppsFolder\Microsoft.Calculator_8wekyb3d8bbwe!App"
 $ParsedInputItems = @($ParsedInputItems | ForEach-Object {  if     ($_.StartsWith('uwp:', [StringComparison]::OrdinalIgnoreCase))              { 'shell:AppsFolder\' + $_.Substring(4) }
                                                             elseif ($_.StartsWith('shell:AppsFolder\', [StringComparison]::OrdinalIgnoreCase)) { 'shell:AppsFolder\' + $_.Substring(17) }
-                                                            elseif ($_ -match '!' -and $_ -notmatch '[/\\]')                                  { 'shell:AppsFolder\' + $_ }
-                                                            else                                                                              {                       $_ }
+                                                            elseif ($_ -match '!' -and $_ -notmatch '[/\\]')                                   { 'shell:AppsFolder\' + $_ }
+                                                            else                                                                               {                       $_ }
 })
 
 
@@ -251,8 +252,7 @@ if ($AllUsers -and -not (Test-IsAdmin)) {
 #     - RemoveResEntry()  : removes an entry from the FavoritesResolve blob by index.
 #
 #   Taskbar notification :
-#     - SendPinNotify()   : fires SHChangeNotify(SHCNE_EXTENDED_EVENT, type=0x0D) which
-#                           tells the Taskbar.dll handler to re-read the blob.
+#     - SendPinNotify()   : posts 0x446 to the taskbar's pinned-items band so it re-enumerates its pins.
 #
 #   Mutex :
 #     - AcquirePinMutex() : acquires the "TaskbarPinListMutex" named kernel mutex to
@@ -300,10 +300,17 @@ public class TaskbarPin {
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     static extern int SHParseDisplayName(string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
 
-    // Notifies the shell of a change. We use SHCNE_EXTENDED_EVENT (0x04000000)
-    // with a custom payload to tell the taskbar handler to re-read its blob.
-    [DllImport("shell32.dll")]
-    static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+    // Retrieves a top-level window handle by class name.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+    // Retrieves a child window handle by class name under a given parent.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr FindWindowEx(IntPtr hWndParent, IntPtr hWndChildAfter, string lpszClass, string lpszWindow);
+
+    // Posts a message to a window's queue without waiting for it to be processed.
+    [DllImport("user32.dll")]
+    static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
     // Creates a COM object instance. Used for IShellLink creation.
     [DllImport("ole32.dll")]
@@ -558,20 +565,17 @@ public class TaskbarPin {
     }
 
     //===========================================================
-    //  SHChangeNotify -- taskbar refresh notification
+    //  Taskbar refresh notification
     //===========================================================
 
-    // Sends SHCNE_EXTENDED_EVENT with type=0x0D payload.
-    // The Taskbar.dll handler picks this up and re-reads the Favorites blob.
+    // Notifies the taskbar that the pinned-items list changed by posting
+    // 0x446 to its pinned-items band, reached through the
+    // Shell_TrayWnd > ReBarWindow32 > MSTaskSwWClass chain.
     public static void SendPinNotify() {
-        byte[] payload = new byte[12];
-        payload[0] = 0x0A; payload[1] = 0x00;
-        payload[2] = 0x0D; payload[3] = 0x00;
-        IntPtr ptr = Marshal.AllocHGlobal(12);
-        try {
-            Marshal.Copy(payload, 0, ptr, 12);
-            SHChangeNotify(0x04000000, 0x3000, ptr, IntPtr.Zero);
-        } finally { Marshal.FreeHGlobal(ptr); }
+        IntPtr trayWindow = FindWindow("Shell_TrayWnd", null);
+        IntPtr reBarWindow = FindWindowEx(trayWindow, IntPtr.Zero, "ReBarWindow32", null);
+        IntPtr pinnedItemsBand = FindWindowEx(reBarWindow, IntPtr.Zero, "MSTaskSwWClass", null);
+        if (pinnedItemsBand != IntPtr.Zero) { PostMessage(pinnedItemsBand, 0x446, IntPtr.Zero, IntPtr.Zero); }
     }
 
     //===========================================================
@@ -616,7 +620,7 @@ public class TaskbarPin {
     // Called between batches of 9 UPDATEITEM notifications to stay under
     // the shell coalescing threshold.
     public static void SHChangeNotifyDrain() {
-        SHChangeNotify(0, 0x1000, IntPtr.Zero, IntPtr.Zero);
+        SHChangeNotify(0, 0x1000, null, IntPtr.Zero);
     }
 
     //===========================================================
@@ -1370,7 +1374,7 @@ if ($Unpin) {
     # Notify the taskbar to refresh its UI
     if ($MatchedShortcutPaths.Count -gt 0) {
         [TaskbarPin]::SendPinNotify()
-        Write-Log "[notify] SHChangeNotify(SHCNE_EXTENDED_EVENT, type=0x0D) sent -- taskbar will re-read blob"
+        Write-Log "[notify] 0x446 posted to MSTaskSwWClass -- taskbar will re-read pinned items"
     }
     # -- AllUsers unpin --
     if ($AllUsers) {
@@ -1538,7 +1542,7 @@ if ($ResolvedPinTargets.Count -eq 0) {
 #   1. Placing a .lnk shortcut in the TaskBar pinned directory
 #   2. Building a binary blob entry (PIDL + BEEF001D extension block)
 #   3. Appending that entry to the Favorites blob in the registry
-#   4. Sending SHChangeNotify so the taskbar handler re-reads the blob
+#   4. Posting 0x446 so the taskbar re-enumerates its pinned items
 # The BEEF001D extension block is the critical piece -- it contains a parsing name
 # string (e.g. "C:\Windows\notepad.exe") that the handler uses to resolve the item
 # when its ILIsEqual primary match fails (which it always does for externally-written PIDLs
@@ -1668,10 +1672,10 @@ if ($DirectBlobWriteIsSupported) {
         } finally {
             if ($MutexWasAcquired) { [TaskbarPin]::ReleasePinMutex(); Write-Log "[mutex] TaskbarPinListMutex released" }
         }
-        # Notify the taskbar to re-read the blob and update the UI
+        # Notify the taskbar to re-enumerate its pinned items and update the UI
         if ($BlobEntriesAddedCount -gt 0) {
             [TaskbarPin]::SendPinNotify()
-            Write-Log "[notify] SHChangeNotify(SHCNE_EXTENDED_EVENT, type=0x0D) sent -- taskbar will pick up new pins"
+            Write-Log "[notify] 0x446 posted to MSTaskSwWClass -- taskbar will pick up new pins"
         }
         Write-Console " done" -Color Green
         # Report each pinned item and clean up temporary shortcuts
