@@ -49,8 +49,11 @@ This tool writes directly to the taskbar's internal data structures with proper 
 # Pin by name (resolved via PATH env)
 .\Pin-Taskbar.ps1 "notepad"
 
-# Pin a UWP app
+# Pin a UWP app by AUMID
 .\Pin-Taskbar.ps1 "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+
+# Pin a UWP app by name
+.\Pin-Taskbar.ps1 "UWP:copilot"
 
 # Pin with wildcard
 .\Pin-Taskbar.ps1 "C:\Tools\*.exe"
