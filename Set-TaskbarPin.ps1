@@ -1,5 +1,5 @@
 function Set-TaskbarPin {
-    # Version 1.2
+    # Version 1.3
     <#
         .EXAMPLE
         Set-TaskbarPin "C:\Users\John\Desktop\MyApp.lnk"
@@ -87,8 +87,8 @@ function Set-TaskbarPin {
     if ($ParsedInputItems.Count -eq 0) { Write-Console "ERROR : Specify -Pin" -Color Red; return }
     $ParsedInputItems = @($ParsedInputItems | ForEach-Object {  if     ($_.StartsWith('uwp:', [StringComparison]::OrdinalIgnoreCase))              { 'shell:AppsFolder\' + $_.Substring(4) }
                                                                 elseif ($_.StartsWith('shell:AppsFolder\', [StringComparison]::OrdinalIgnoreCase)) { 'shell:AppsFolder\' + $_.Substring(17) }
-                                                                elseif ($_ -match '!' -and $_ -notmatch '[/\\]')                                  { 'shell:AppsFolder\' + $_ }
-                                                                else                                                                              {                       $_ }
+                                                                elseif ($_ -match '!' -and $_ -notmatch '[/\\]')                                   { 'shell:AppsFolder\' + $_ }
+                                                                else                                                                               {                       $_ }
     })
     function Test-IsAdmin {
         $CurrentIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -108,7 +108,9 @@ public class TaskbarPin {
     [DllImport("shell32.dll")]static extern void ILFree(IntPtr pidl);
     [DllImport("shell32.dll")]static extern IntPtr ILFindLastID(IntPtr pidl);
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]static extern int SHParseDisplayName(string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
-    [DllImport("shell32.dll")]static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]static extern IntPtr FindWindowEx(IntPtr hWndParent, IntPtr hWndChildAfter, string lpszClass, string lpszWindow);
+    [DllImport("user32.dll")]static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     [DllImport("ole32.dll")]static extern int CoCreateInstance(ref Guid rclsid, IntPtr pUnk, uint ctx, ref Guid riid, out IntPtr ppv);
     [DllImport("ole32.dll")]static extern int PropVariantClear(IntPtr pvar);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]static extern IntPtr CreateMutexExW(IntPtr lpMutexAttributes, string lpName, uint dwFlags, uint dwDesiredAccess);
@@ -232,9 +234,10 @@ public class TaskbarPin {
         });
     }
     public static void SendPinNotify() {
-        byte[] payload = new byte[12]; payload[0] = 0x0A; payload[1] = 0x00; payload[2] = 0x0D; payload[3] = 0x00;
-        IntPtr ptr = Marshal.AllocHGlobal(12);
-        try { Marshal.Copy(payload, 0, ptr, 12); SHChangeNotify(0x04000000, 0x3000, ptr, IntPtr.Zero); } finally { Marshal.FreeHGlobal(ptr); }
+        IntPtr trayWindow = FindWindow("Shell_TrayWnd", null);
+        IntPtr reBarWindow = FindWindowEx(trayWindow, IntPtr.Zero, "ReBarWindow32", null);
+        IntPtr pinnedItemsBand = FindWindowEx(reBarWindow, IntPtr.Zero, "MSTaskSwWClass", null);
+        if (pinnedItemsBand != IntPtr.Zero) { PostMessage(pinnedItemsBand, 0x446, IntPtr.Zero, IntPtr.Zero); }
     }
     static IntPtr _mutexHandle = IntPtr.Zero;
     public static bool AcquirePinMutex(int timeoutMs) {
@@ -245,7 +248,7 @@ public class TaskbarPin {
     public static void ReleasePinMutex() { if (_mutexHandle != IntPtr.Zero) { ReleaseMutex(_mutexHandle); CloseHandle(_mutexHandle); _mutexHandle = IntPtr.Zero; } }
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]static extern void SHChangeNotify(int wEventId, uint uFlags, string dwItem1, IntPtr dwItem2);
     public static void SHChangeNotifyUpdateItem(string path) { SHChangeNotify(0x2000, 0x0005, path, IntPtr.Zero); }
-    public static void SHChangeNotifyDrain() { SHChangeNotify(0, 0x1000, IntPtr.Zero, IntPtr.Zero); }
+    public static void SHChangeNotifyDrain() { SHChangeNotify(0, 0x1000, null, IntPtr.Zero); }
     public static int FindBlobEntry(byte[] blob, string filename) {
         byte[] needle = System.Text.Encoding.Unicode.GetBytes(filename); int pos = 0; int idx = 0;
         while (pos < blob.Length && blob[pos] != 0xFF) {
@@ -376,19 +379,19 @@ public class TaskbarPin {
         if (-not $WshShellComObjectRef.Value) { $WshShellComObjectRef.Value = New-Object -ComObject WScript.Shell }
         $NewShortcutObject = $WshShellComObjectRef.Value.CreateShortcut($TemporaryLnkPath)
         if ([IO.Directory]::Exists($ResolvedTargetPath)) {
-            $NewShortcutObject.TargetPath      = [IO.Path]::Combine($env:SystemRoot, 'explorer.exe')
-            $NewShortcutObject.Arguments        = "`"$ResolvedTargetPath`""
-            $NewShortcutObject.IconLocation     = [IO.Path]::Combine($env:SystemRoot, 'System32\shell32.dll') + ',3'
-            $NewShortcutObject.WorkingDirectory = $ResolvedTargetPath
-            $Beef001dContentRef.Value           = $ResolvedTargetPath
+            $NewShortcutObject.TargetPath        = [IO.Path]::Combine($env:SystemRoot, 'explorer.exe')
+            $NewShortcutObject.Arguments         = "`"$ResolvedTargetPath`""
+            $NewShortcutObject.IconLocation      = [IO.Path]::Combine($env:SystemRoot, 'System32\shell32.dll') + ',3'
+            $NewShortcutObject.WorkingDirectory  = $ResolvedTargetPath
+            $Beef001dContentRef.Value            = $ResolvedTargetPath
         } elseif ($TargetFileExtension -eq '.cpl') {
-            $NewShortcutObject.TargetPath       = [IO.Path]::Combine($env:SystemRoot, 'System32\rundll32.exe')
+            $NewShortcutObject.TargetPath        = [IO.Path]::Combine($env:SystemRoot, 'System32\rundll32.exe')
             $NewShortcutObject.Arguments         = "shell32.dll,Control_RunDLL `"$ResolvedTargetPath`""
             $NewShortcutObject.IconLocation      = "$ResolvedTargetPath,0"
             $NewShortcutObject.WorkingDirectory  = [IO.Path]::GetDirectoryName($ResolvedTargetPath)
             $Beef001dContentRef.Value            = $ResolvedTargetPath
         } else {
-            $NewShortcutObject.TargetPath       = $ResolvedTargetPath
+            $NewShortcutObject.TargetPath        = $ResolvedTargetPath
             $NewShortcutObject.WorkingDirectory  = [IO.Path]::GetDirectoryName($ResolvedTargetPath)
             $Beef001dContentRef.Value            = $ResolvedTargetPath
         }
