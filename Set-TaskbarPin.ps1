@@ -1,18 +1,13 @@
 function Set-TaskbarPin {
-    # Version 1.3
+    # Version 1.4
     <#
         .EXAMPLE
-        Set-TaskbarPin "C:\Users\John\Desktop\MyApp.lnk"
-        Set-TaskbarPin "C:\Windows\regedit.exe;C:\MyFolder" -AllUsers
+        Set-TaskbarPin firefox
+        Set-TaskbarPin "C:\App1.lnk;C:\Windows\regedit.exe;C:\MyFolder;C:\Tools\*.exe" -AllUsers
         Set-TaskbarPin "shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
         Set-TaskbarPin "uwp:Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
-        Set-TaskbarPin "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
-        Set-TaskbarPin "C:\App1.lnk;C:\App2.lnk;C:\App3.exe"
-        Set-TaskbarPin "notepad" 
-        Set-TaskbarPin "C:\Tools\*.exe"
-        Set-TaskbarPin -Unpin "Notepad*" -AllUsers
-        Set-TaskbarPin "C:\MyApp.lnk" -Silent
-        Set-TaskbarPin "C:\Windows\System32\services.msc;C:\Windows\System32\main.cpl"
+        Set-TaskbarPin -Unpin * -AllUsers
+        Set-TaskbarPin "C:\MyApp.lnk;C:\Windows\System32\services.msc;C:\Windows\System32\main.cpl" -Silent
     #>
     param(
         [Parameter(Position = 0)]
@@ -22,53 +17,49 @@ function Set-TaskbarPin {
         [Alias('Everyone', 'All')]      [switch]$AllUsers
     )
     $ErrorActionPreference = 'Stop'
-    $script:SuppressConsoleNewlines = $false
+    $script:SuppressConsoleOutput = $false
     #region ENVIRONMENT
+    function Test-RegistrySubKeyExists {
+        param($RegistryRootKey, [string]$RegistrySubKeyPath)
+        $ProbeHandle = $null
+        try { $ProbeHandle = $RegistryRootKey.OpenSubKey($RegistrySubKeyPath, $false) } catch { }
+        if ($ProbeHandle) { $ProbeHandle.Close(); return $true }
+        return $false
+    }
     $RoamingAppDataPath              = [Environment]::GetFolderPath('ApplicationData')
     $TaskBarPinnedDirectory          = [IO.Path]::Combine($RoamingAppDataPath, 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar')
     $QuickLaunchDirectory            = [IO.Path]::Combine($RoamingAppDataPath, 'Microsoft\Internet Explorer\Quick Launch')
     $TaskBandRegistrySubKey          = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband'
     $TaskBarRelativeProfilePath      = 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+    $QuickLaunchRelativePath         = 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch'
     $DoNotExpandRegistryOption       = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
     $BinaryRegistryValueKind         = [Microsoft.Win32.RegistryValueKind]::Binary
     $DwordRegistryValueKind          = [Microsoft.Win32.RegistryValueKind]::DWord
-    $TaskBarDirectoryExists          = [IO.Directory]::Exists($TaskBarPinnedDirectory)
-    $QuickLaunchDirectoryExists      = [IO.Directory]::Exists($QuickLaunchDirectory)
-    $TaskBandRegistryKeyExists       = $false
-    $RegistryProbeHandle             = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($TaskBandRegistrySubKey, $false)
-    if ($RegistryProbeHandle) { $TaskBandRegistryKeyExists = $true; $RegistryProbeHandle.Close() }
     $CurrentUserSecurityIdentifier   = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-    $DirectBlobWriteIsSupported      = $TaskBarDirectoryExists -and $TaskBandRegistryKeyExists
-    # -- Cross-user elevation detection --
     $IsRunningCrossUser         = $false
+    $InteractiveUserProfilePath = $null
     $EffectivePrimaryUserSID    = $CurrentUserSecurityIdentifier
     $CurrentProcessSessionId    = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
     foreach ($CandidateSidKeyName in [Microsoft.Win32.Registry]::Users.GetSubKeyNames()) {
         if ($CandidateSidKeyName.Length -lt 20 -or $CandidateSidKeyName.EndsWith('_Classes')) { continue }
-        $SessionVolatileEnvKey = $null
-        try { $SessionVolatileEnvKey = [Microsoft.Win32.Registry]::Users.OpenSubKey("$CandidateSidKeyName\Volatile Environment\$CurrentProcessSessionId") } catch { }
-        if ($SessionVolatileEnvKey) {
-            $SessionVolatileEnvKey.Close()
-            if ($CandidateSidKeyName -ne $CurrentUserSecurityIdentifier) {
-                $IsRunningCrossUser      = $true
-                $EffectivePrimaryUserSID = $CandidateSidKeyName
-                $ProfileListKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$CandidateSidKeyName")
-                if ($ProfileListKey) {
-                    $InteractiveUserProfilePath = $ProfileListKey.GetValue('ProfileImagePath', ''); $ProfileListKey.Close()
-                    $TaskBarPinnedDirectory     = [IO.Path]::Combine($InteractiveUserProfilePath, $TaskBarRelativeProfilePath)
-                    $QuickLaunchDirectory       = [IO.Path]::Combine($InteractiveUserProfilePath, 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch')
-                    $TaskBarDirectoryExists     = [IO.Directory]::Exists($TaskBarPinnedDirectory)
-                    $QuickLaunchDirectoryExists = [IO.Directory]::Exists($QuickLaunchDirectory)
-                    $TaskBandRegistryKeyExists  = $false
-                    $CrossUserRegistryProbe = [Microsoft.Win32.Registry]::Users.OpenSubKey("$CandidateSidKeyName\$TaskBandRegistrySubKey", $false)
-                    if ($CrossUserRegistryProbe) { $TaskBandRegistryKeyExists = $true; $CrossUserRegistryProbe.Close() }
-                    $DirectBlobWriteIsSupported = $TaskBarDirectoryExists -and $TaskBandRegistryKeyExists
-                }
+        if (-not (Test-RegistrySubKeyExists ([Microsoft.Win32.Registry]::Users) "$CandidateSidKeyName\Volatile Environment\$CurrentProcessSessionId")) { continue }
+        if ($CandidateSidKeyName -ne $CurrentUserSecurityIdentifier) {
+            $IsRunningCrossUser      = $true
+            $EffectivePrimaryUserSID = $CandidateSidKeyName
+            $ProfileListKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$CandidateSidKeyName")
+            if ($ProfileListKey) {
+                $InteractiveUserProfilePath = $ProfileListKey.GetValue('ProfileImagePath', ''); $ProfileListKey.Close()
+                $TaskBarPinnedDirectory     = [IO.Path]::Combine($InteractiveUserProfilePath, $TaskBarRelativeProfilePath)
+                $QuickLaunchDirectory       = [IO.Path]::Combine($InteractiveUserProfilePath, $QuickLaunchRelativePath)
             }
-            break
         }
+        break
     }
-    #region LOGGING
+    $TaskBarDirectoryExists     = [IO.Directory]::Exists($TaskBarPinnedDirectory)
+    $QuickLaunchDirectoryExists = [IO.Directory]::Exists($QuickLaunchDirectory)
+    $TaskBandRegistryKeyExists  = if ($IsRunningCrossUser) { Test-RegistrySubKeyExists ([Microsoft.Win32.Registry]::Users) "$EffectivePrimaryUserSID\$TaskBandRegistrySubKey" } else { Test-RegistrySubKeyExists ([Microsoft.Win32.Registry]::CurrentUser) $TaskBandRegistrySubKey }
+    $DirectBlobWriteIsSupported = $TaskBarDirectoryExists -and $TaskBandRegistryKeyExists
+    #region CONSOLE
     function Write-Console {
         param([string]$Message, [string]$Color = 'White', [switch]$NoNewline)
         if ($Silent -or $script:SuppressConsoleOutput) { return }
@@ -83,7 +74,8 @@ function Set-TaskbarPin {
     }
     #region INPUT VALIDATION
     if (-not $Pin) { Write-Console "ERROR : Specify -Pin" -Color Red; return }
-    $ParsedInputItems = @($Pin -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $LiteralSemicolonSentinel = [string][char]1
+    $ParsedInputItems = @($Pin.Replace(';;', $LiteralSemicolonSentinel) -split ';' | ForEach-Object { $_.Replace($LiteralSemicolonSentinel, ';').Trim() } | Where-Object { $_ })
     if ($ParsedInputItems.Count -eq 0) { Write-Console "ERROR : Specify -Pin" -Color Red; return }
     $ParsedInputItems = @($ParsedInputItems | ForEach-Object {  if     ($_.StartsWith('uwp:', [StringComparison]::OrdinalIgnoreCase))              { 'shell:AppsFolder\' + $_.Substring(4) }
                                                                 elseif ($_.StartsWith('shell:AppsFolder\', [StringComparison]::OrdinalIgnoreCase)) { 'shell:AppsFolder\' + $_.Substring(17) }
@@ -207,12 +199,10 @@ public class TaskbarPin {
         try { Vtbl<FnSetIDList>(vtLink, 5)(psl, pidl); if (aumid != null && aumid.Length > 0) WriteAumidToStore(psl, vtLink, aumid); return PersistSave(psl, vtLink, lnkPath); }
         finally { Release(psl, vtLink); }
     }
-    public static bool CreateAppShortcut(string aumid, string lnkPath) {
-        return RunOnSTA<bool>(delegate() { IntPtr pidl = ParseDisplayName("shell:AppsFolder\\" + aumid); if (pidl == IntPtr.Zero) return false; try { return CreateShortcutFromPidl(pidl, lnkPath, aumid); } finally { ILFree(pidl); } });
-    }
     public static bool CreatePidlShortcut(string displayName, string lnkPath, string appUserModelId) {
-        return RunOnSTA<bool>(delegate() { IntPtr pidl; uint sfgao; if (SHParseDisplayName(displayName, IntPtr.Zero, out pidl, 0, out sfgao) != 0 || pidl == IntPtr.Zero) return false; try { return CreateShortcutFromPidl(pidl, lnkPath, appUserModelId); } finally { ILFree(pidl); } });
+        return RunOnSTA<bool>(delegate() { IntPtr pidl = ParseDisplayName(displayName); if (pidl == IntPtr.Zero) return false; try { return CreateShortcutFromPidl(pidl, lnkPath, appUserModelId); } finally { ILFree(pidl); } });
     }
+    public static bool CreateAppShortcut(string aumid, string lnkPath) { return CreatePidlShortcut("shell:AppsFolder\\" + aumid, lnkPath, aumid); }
     public static string GetAumid(string lnkPath) {
         return RunOnSTA<string>(delegate() {
             Guid cls = CLSID_ShellLink; Guid iid = IID_IShellLinkW; IntPtr psl;
@@ -246,9 +236,6 @@ public class TaskbarPin {
         if (r == 0 || r == 0x80) { _mutexHandle = h; return true; } CloseHandle(h); return false;
     }
     public static void ReleasePinMutex() { if (_mutexHandle != IntPtr.Zero) { ReleaseMutex(_mutexHandle); CloseHandle(_mutexHandle); _mutexHandle = IntPtr.Zero; } }
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]static extern void SHChangeNotify(int wEventId, uint uFlags, string dwItem1, IntPtr dwItem2);
-    public static void SHChangeNotifyUpdateItem(string path) { SHChangeNotify(0x2000, 0x0005, path, IntPtr.Zero); }
-    public static void SHChangeNotifyDrain() { SHChangeNotify(0, 0x1000, null, IntPtr.Zero); }
     public static int FindBlobEntry(byte[] blob, string filename) {
         byte[] needle = System.Text.Encoding.Unicode.GetBytes(filename); int pos = 0; int idx = 0;
         while (pos < blob.Length && blob[pos] != 0xFF) {
@@ -268,7 +255,78 @@ public class TaskbarPin {
         while (pos + 4 <= blob.Length) { uint linkSize = BitConverter.ToUInt32(blob, pos); if (linkSize == 0 || pos + 4 + (int)linkSize > blob.Length) break; int total = 4 + (int)linkSize; if (idx != removeIdx) ms.Write(blob, pos, total); pos += total; idx++; }
         return ms.ToArray();
     }
+    static string ReadAnsiZ(byte[] d, int pos) { int end = pos; while (end < d.Length && d[end] != 0) end++; return System.Text.Encoding.Default.GetString(d, pos, end - pos); }
+    static string ReadUniZ(byte[] d, int pos) { int end = pos; while (end + 1 < d.Length && (d[end] != 0 || d[end + 1] != 0)) end += 2; return System.Text.Encoding.Unicode.GetString(d, pos, end - pos); }
+    static string ReadStoreAumid(byte[] d, int pos, int end) {
+        byte[] fmtid = FMTID_AppUserModel.ToByteArray();
+        while (pos + 28 <= end) {
+            uint storageSize = BitConverter.ToUInt32(d, pos); if (storageSize == 0 || pos + storageSize > end) break;
+            bool fmtidMatch = true; for (int i = 0; i < 16; i++) { if (d[pos + 8 + i] != fmtid[i]) { fmtidMatch = false; break; } }
+            if (fmtidMatch) {
+                int vpos = pos + 24; int vend = pos + (int)storageSize;
+                while (vpos + 13 <= vend) {
+                    uint valueSize = BitConverter.ToUInt32(d, vpos); if (valueSize == 0 || vpos + valueSize > vend) break;
+                    uint propId = BitConverter.ToUInt32(d, vpos + 4); ushort vt = BitConverter.ToUInt16(d, vpos + 9);
+                    if (propId == 5 && vt == 0x1F && vpos + 17 <= vend) return ReadUniZ(d, vpos + 17);
+                    vpos += (int)valueSize;
+                }
+            }
+            pos += (int)storageSize;
+        }
+        return "";
+    }
+    static void ParseLnk(byte[] d, string lnkDirectory, out string target, out string aumid) {
+        target = ""; aumid = "";
+        if (d.Length < 0x4C || BitConverter.ToInt32(d, 0) != 0x4C) return;
+        uint flags = BitConverter.ToUInt32(d, 20);
+        int pos = 0x4C;
+        if ((flags & 0x01) != 0) { if (pos + 2 > d.Length) return; pos += 2 + BitConverter.ToUInt16(d, pos); }
+        if ((flags & 0x02) != 0 && pos + 36 <= d.Length) {
+            int li = pos;
+            uint liSize = BitConverter.ToUInt32(d, li); uint liHead = BitConverter.ToUInt32(d, li + 4); uint liFlags = BitConverter.ToUInt32(d, li + 8);
+            if ((liFlags & 0x01) != 0) {
+                if (liHead >= 0x24) { target = ReadUniZ(d, li + (int)BitConverter.ToUInt32(d, li + 28)) + ReadUniZ(d, li + (int)BitConverter.ToUInt32(d, li + 32)); }
+                else { target = ReadAnsiZ(d, li + (int)BitConverter.ToUInt32(d, li + 16)) + ReadAnsiZ(d, li + (int)BitConverter.ToUInt32(d, li + 24)); }
+            }
+            pos = li + (int)liSize;
+        }
+        bool isUnicode = (flags & 0x80) != 0;
+        string relativePath = "";
+        uint[] stringDataFlags = new uint[] { 0x04, 0x08, 0x10, 0x20, 0x40 };
+        for (int i = 0; i < stringDataFlags.Length; i++) {
+            if ((flags & stringDataFlags[i]) == 0) continue;
+            if (pos + 2 > d.Length) return;
+            int charCount = BitConverter.ToUInt16(d, pos); int byteCount = charCount * (isUnicode ? 2 : 1);
+            if (pos + 2 + byteCount > d.Length) return;
+            if (stringDataFlags[i] == 0x08) { relativePath = isUnicode ? System.Text.Encoding.Unicode.GetString(d, pos + 2, byteCount) : System.Text.Encoding.Default.GetString(d, pos + 2, byteCount); }
+            pos += 2 + byteCount;
+        }
+        while (pos + 8 <= d.Length) {
+            uint blockSize = BitConverter.ToUInt32(d, pos); if (blockSize < 8 || pos + blockSize > d.Length) break;
+            uint blockSig = BitConverter.ToUInt32(d, pos + 4);
+            if (blockSig == 0xA0000001 && target.Length == 0 && blockSize >= 8 + 260 + 520) {
+                string envTarget = ReadUniZ(d, pos + 8 + 260); if (envTarget.Length == 0) envTarget = ReadAnsiZ(d, pos + 8);
+                if (envTarget.Length > 0) target = Environment.ExpandEnvironmentVariables(envTarget);
+            }
+            if (blockSig == 0xA0000009 && aumid.Length == 0) { aumid = ReadStoreAumid(d, pos + 8, pos + (int)blockSize); }
+            pos += (int)blockSize;
+        }
+        if (target.Length == 0 && relativePath.Length > 0 && lnkDirectory.Length > 0) { try { target = System.IO.Path.GetFullPath(System.IO.Path.Combine(lnkDirectory, relativePath)); } catch { } }
+    }
+    public static LnkEntry[] GetLnkCatalog(string directory, bool recurse, int rank) {
+        string[] files;
+        try { files = System.IO.Directory.GetFiles(directory, "*.lnk", recurse ? System.IO.SearchOption.AllDirectories : System.IO.SearchOption.TopDirectoryOnly); } catch { return new LnkEntry[0]; }
+        LnkEntry[] entries = new LnkEntry[files.Length];
+        for (int i = 0; i < files.Length; i++) {
+            LnkEntry entry = new LnkEntry(); entry.LnkPath = files[i]; entry.DisplayName = System.IO.Path.GetFileNameWithoutExtension(files[i]); entry.Rank = rank;
+            string target = ""; string aumid = "";
+            try { byte[] d = System.IO.File.ReadAllBytes(files[i]); ParseLnk(d, System.IO.Path.GetDirectoryName(files[i]), out target, out aumid); } catch { }
+            entry.TargetPath = target; entry.Aumid = aumid; entries[i] = entry;
+        }
+        return entries;
+    }
 }
+public class LnkEntry { public string LnkPath; public string DisplayName; public string TargetPath; public string Aumid; public int Rank; }
 '@
     }
     function Open-EffectiveTaskbandKey {
@@ -286,22 +344,16 @@ public class TaskbarPin {
         $MatchedResult = $null
         foreach ($ControlPanelItem in $CplNamespace.Items()) {
             $ControlPanelItemPath = $ControlPanelItem.Path
-            $AllGuidsInPath = [regex]::Matches($ControlPanelItemPath, '\{[0-9A-Fa-f\-]+\}')
-            foreach ($GuidMatch in $AllGuidsInPath) {
-                $CandidateGuid = $GuidMatch.Value
-                $InprocRegistryKey = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey("CLSID\$CandidateGuid\InprocServer32")
+            foreach ($GuidMatch in [regex]::Matches($ControlPanelItemPath, '\{[0-9A-Fa-f\-]+\}')) {
+                $InprocRegistryKey = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey("CLSID\$($GuidMatch.Value)\InprocServer32")
                 if ($InprocRegistryKey) {
                     $ModulePath = $InprocRegistryKey.GetValue($null, ''); $InprocRegistryKey.Close()
-                    if ($ModulePath -and [IO.Path]::GetFileName($ModulePath).ToLower() -eq $CplFileName) {
-                        $MatchedResult = @{ Name = $ControlPanelItem.Name; Path = $ControlPanelItemPath }; break
-                    }
+                    if ($ModulePath -and [IO.Path]::GetFileName($ModulePath).ToLower() -eq $CplFileName) { $MatchedResult = @{ Name = $ControlPanelItem.Name; Path = $ControlPanelItemPath }; break }
                 }
-                $DefaultIconKey = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey("CLSID\$CandidateGuid\DefaultIcon")
+                $DefaultIconKey = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey("CLSID\$($GuidMatch.Value)\DefaultIcon")
                 if ($DefaultIconKey) {
                     $IconValue = $DefaultIconKey.GetValue($null, ''); $DefaultIconKey.Close()
-                    if ($IconValue -and $IconValue.ToLower().Contains($CplBaseName)) {
-                        $MatchedResult = @{ Name = $ControlPanelItem.Name; Path = $ControlPanelItemPath }; break
-                    }
+                    if ($IconValue -and $IconValue.ToLower().Contains($CplBaseName)) { $MatchedResult = @{ Name = $ControlPanelItem.Name; Path = $ControlPanelItemPath }; break }
                 }
             }
             [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ControlPanelItem)
@@ -347,15 +399,101 @@ public class TaskbarPin {
         }
         return
     }
+    $script:AppsFolderSnapshot = $null
+    function Get-AppsFolderSnapshot {
+        if ($null -ne $script:AppsFolderSnapshot) { return $script:AppsFolderSnapshot }
+        $CollectedApplicationEntries = New-Object System.Collections.ArrayList
+        try {
+            $ShellApplicationForAppsFolder = New-Object -ComObject Shell.Application
+            $ApplicationsNamespace         = $ShellApplicationForAppsFolder.Namespace('shell:AppsFolder')
+            foreach ($ApplicationItem in $ApplicationsNamespace.Items()) {
+                $ApplicationTargetParsingPath = ''
+                try { $ApplicationTargetParsingPath = [string]$ApplicationItem.ExtendedProperty('System.Link.TargetParsingPath') } catch { }
+                [void]$CollectedApplicationEntries.Add(@{ Aumid = $ApplicationItem.Path; DisplayName = $ApplicationItem.Name; TargetParsingPath = $ApplicationTargetParsingPath })
+                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ApplicationItem)
+            }
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ApplicationsNamespace)
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShellApplicationForAppsFolder)
+        } catch { }
+        $script:AppsFolderSnapshot = @($CollectedApplicationEntries.ToArray())
+        return $script:AppsFolderSnapshot
+    }
+    $script:ShortcutCatalog = $null
+    function Get-ShortcutCatalog {
+        if ($null -ne $script:ShortcutCatalog) { return $script:ShortcutCatalog }
+        Initialize-NativeHelper
+        $PrimaryUserProgramsDirectory = if ($IsRunningCrossUser -and $InteractiveUserProfilePath) { [IO.Path]::Combine($InteractiveUserProfilePath, 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs') } else { [Environment]::GetFolderPath('Programs') }
+        $ShortcutSearchRoots = @(
+            @{ Directory = [Environment]::GetFolderPath('CommonPrograms'); Rank = 1; Recurse = $true },
+            @{ Directory = $PrimaryUserProgramsDirectory;                  Rank = 1; Recurse = $true },
+            @{ Directory = $QuickLaunchDirectory;                          Rank = 2; Recurse = $false }
+        )
+        if ($AllUsers) {
+            foreach ($UserProfile in @(Get-UserProfiles)) {
+                $ShortcutSearchRoots += @{ Directory = [IO.Path]::Combine($UserProfile.ProfilePath, 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'); Rank = 1; Recurse = $true }
+                $ShortcutSearchRoots += @{ Directory = [IO.Path]::Combine($UserProfile.ProfilePath, $QuickLaunchRelativePath);                                Rank = 2; Recurse = $false }
+            }
+        }
+        $CollectedShortcutEntries = New-Object System.Collections.ArrayList
+        foreach ($SearchRoot in $ShortcutSearchRoots) {
+            if (-not $SearchRoot.Directory -or -not [IO.Directory]::Exists($SearchRoot.Directory)) { continue }
+            $CollectedShortcutEntries.AddRange([TaskbarPin]::GetLnkCatalog($SearchRoot.Directory, $SearchRoot.Recurse, $SearchRoot.Rank))
+        }
+        $script:ShortcutCatalog = @($CollectedShortcutEntries.ToArray())
+        return $script:ShortcutCatalog
+    }
+    function Resolve-ExecutableIdentity {
+        param([string]$ExecutableFullPath)
+        foreach ($ApplicationEntry in (Get-AppsFolderSnapshot)) {
+            if ($ApplicationEntry.TargetParsingPath -and $ApplicationEntry.TargetParsingPath -eq $ExecutableFullPath) { return $ApplicationEntry }
+        }
+        foreach ($CatalogRank in 1, 2) {
+            foreach ($ShortcutEntry in (Get-ShortcutCatalog)) {
+                if ($ShortcutEntry.Rank -ne $CatalogRank -or $ShortcutEntry.TargetPath -ne $ExecutableFullPath) { continue }
+                if ($ShortcutEntry.Aumid) { return @{ Aumid = $ShortcutEntry.Aumid; DisplayName = $ShortcutEntry.DisplayName } }
+            }
+        }
+        return $null
+    }
+    function Find-ApplicationMatches {
+        param([string]$NameOrAumidPattern)
+        $PatternHasWildcard    = $NameOrAumidPattern -match '[*?]'
+        $EffectiveMatchPattern = if ($PatternHasWildcard) { $NameOrAumidPattern } else { "*$NameOrAumidPattern*" }
+        $MatchedApplications   = @()
+        $AlreadyMatchedAumids  = @{}
+        $AlreadyMatchedTargets = @{}
+        foreach ($ApplicationEntry in (Get-AppsFolderSnapshot)) {
+            if ($ApplicationEntry.DisplayName -like $EffectiveMatchPattern -or $ApplicationEntry.Aumid -like $EffectiveMatchPattern) {
+                $MatchedApplications += @{ Kind = 'Aumid'; Aumid = $ApplicationEntry.Aumid; DisplayName = $ApplicationEntry.DisplayName }
+                $AlreadyMatchedAumids[$ApplicationEntry.Aumid] = $true
+                if ($ApplicationEntry.TargetParsingPath) { $AlreadyMatchedTargets[$ApplicationEntry.TargetParsingPath.ToLower()] = $true }
+            }
+        }
+        if (-not $PatternHasWildcard -and $MatchedApplications.Count -gt 0) { return $MatchedApplications }
+        foreach ($CatalogRank in 1, 2) {
+            foreach ($ShortcutEntry in (Get-ShortcutCatalog)) {
+                if ($ShortcutEntry.Rank -ne $CatalogRank -or $ShortcutEntry.DisplayName -notlike $EffectiveMatchPattern) { continue }
+                if ($ShortcutEntry.TargetPath -and $AlreadyMatchedTargets.ContainsKey($ShortcutEntry.TargetPath.ToLower())) { continue }
+                if ($ShortcutEntry.Aumid -and $AlreadyMatchedAumids.ContainsKey($ShortcutEntry.Aumid)) { continue }
+                $MatchedApplications += @{ Kind = 'Lnk'; LnkPath = $ShortcutEntry.LnkPath; DisplayName = $ShortcutEntry.DisplayName }
+                if ($ShortcutEntry.Aumid) { $AlreadyMatchedAumids[$ShortcutEntry.Aumid] = $true }
+                if ($ShortcutEntry.TargetPath) { $AlreadyMatchedTargets[$ShortcutEntry.TargetPath.ToLower()] = $true }
+            }
+            if (-not $PatternHasWildcard -and $MatchedApplications.Count -gt 0) { return $MatchedApplications }
+        }
+        return $MatchedApplications
+    }
     function New-TargetShortcut {
         param([string]$ResolvedTargetPath, [ref]$Beef001dContentRef, [ref]$WshShellComObjectRef)
         $TargetFileExtension = [IO.Path]::GetExtension($ResolvedTargetPath).ToLower()
         if ($TargetFileExtension -eq '.lnk') {
             if (-not $WshShellComObjectRef.Value) { $WshShellComObjectRef.Value = New-Object -ComObject WScript.Shell }
             $ShortcutObject = $WshShellComObjectRef.Value.CreateShortcut($ResolvedTargetPath)
-            $Beef001dContentRef.Value = $ShortcutObject.TargetPath
+            $ShortcutTargetPath = $ShortcutObject.TargetPath
             [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShortcutObject)
-            if (-not $Beef001dContentRef.Value) { $Beef001dContentRef.Value = [TaskbarPin]::GetAumid($ResolvedTargetPath) }
+            $ShortcutAppUserModelId = ''
+            if ('TaskbarPin' -as [Type]) { $ShortcutAppUserModelId = [TaskbarPin]::GetAumid($ResolvedTargetPath) }
+            if ($ShortcutAppUserModelId) { $Beef001dContentRef.Value = $ShortcutAppUserModelId } else { $Beef001dContentRef.Value = $ShortcutTargetPath }
             return $ResolvedTargetPath
         }
         if ($TargetFileExtension -eq '.cpl') {
@@ -383,18 +521,16 @@ public class TaskbarPin {
             $NewShortcutObject.Arguments         = "`"$ResolvedTargetPath`""
             $NewShortcutObject.IconLocation      = [IO.Path]::Combine($env:SystemRoot, 'System32\shell32.dll') + ',3'
             $NewShortcutObject.WorkingDirectory  = $ResolvedTargetPath
-            $Beef001dContentRef.Value            = $ResolvedTargetPath
         } elseif ($TargetFileExtension -eq '.cpl') {
             $NewShortcutObject.TargetPath        = [IO.Path]::Combine($env:SystemRoot, 'System32\rundll32.exe')
             $NewShortcutObject.Arguments         = "shell32.dll,Control_RunDLL `"$ResolvedTargetPath`""
             $NewShortcutObject.IconLocation      = "$ResolvedTargetPath,0"
             $NewShortcutObject.WorkingDirectory  = [IO.Path]::GetDirectoryName($ResolvedTargetPath)
-            $Beef001dContentRef.Value            = $ResolvedTargetPath
         } else {
             $NewShortcutObject.TargetPath        = $ResolvedTargetPath
             $NewShortcutObject.WorkingDirectory  = [IO.Path]::GetDirectoryName($ResolvedTargetPath)
-            $Beef001dContentRef.Value            = $ResolvedTargetPath
         }
+        $Beef001dContentRef.Value = $ResolvedTargetPath
         $NewShortcutObject.Save()
         [void][Runtime.InteropServices.Marshal]::ReleaseComObject($NewShortcutObject)
         return $TemporaryLnkPath
@@ -431,38 +567,38 @@ public class TaskbarPin {
         if (-not $ProfileListRegistryKey) { return @() }
         $DiscoveredProfiles = @()
         foreach ($ProfileSid in $ProfileListRegistryKey.GetSubKeyNames()) {
-            if ($ProfileSid.Length -lt 20) { continue }
-            if ($ProfileSid -eq $EffectivePrimaryUserSID) { continue }
+            if ($ProfileSid.Length -lt 20 -or $ProfileSid -eq $EffectivePrimaryUserSID) { continue }
             $ProfileSubKey = $ProfileListRegistryKey.OpenSubKey($ProfileSid)
             if (-not $ProfileSubKey) { continue }
             $ProfileImagePath = $ProfileSubKey.GetValue('ProfileImagePath', ''); $ProfileSubKey.Close()
             if (-not $ProfileImagePath -or -not [IO.Directory]::Exists($ProfileImagePath)) { continue }
             $ProfileFolderName = [IO.Path]::GetFileName($ProfileImagePath).ToLower()
             if ($ProfileFolderName -eq 'systemprofile' -or $ProfileFolderName -eq 'localservice' -or $ProfileFolderName -eq 'networkservice') { continue }
-            $DiscoveredProfiles += New-Object PSObject -Property @{ SID = $ProfileSid; ProfilePath = $ProfileImagePath }
+            $DiscoveredProfiles += @{ SID = $ProfileSid; ProfilePath = $ProfileImagePath }
         }
         $ProfileListRegistryKey.Close()
-        $DefaultUserNtUserDatPath = [IO.Path]::Combine($env:SystemDrive, 'Users\Default\NTUSER.DAT')
-        if ([IO.File]::Exists($DefaultUserNtUserDatPath)) {
-            $DiscoveredProfiles += New-Object PSObject -Property @{ SID = 'Default'; ProfilePath = [IO.Path]::Combine($env:SystemDrive, 'Users\Default') }
+        if ([IO.File]::Exists([IO.Path]::Combine($env:SystemDrive, 'Users\Default\NTUSER.DAT'))) {
+            $DiscoveredProfiles += @{ SID = 'Default'; ProfilePath = [IO.Path]::Combine($env:SystemDrive, 'Users\Default') }
         }
         return $DiscoveredProfiles
+    }
+    function Invoke-RegistryExecutable {
+        param([string]$ArgumentLine)
+        $RegProcessStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $RegProcessStartInfo.FileName = 'reg.exe'; $RegProcessStartInfo.Arguments = $ArgumentLine
+        $RegProcessStartInfo.UseShellExecute = $false; $RegProcessStartInfo.CreateNoWindow = $true; $RegProcessStartInfo.RedirectStandardError = $true
+        $RegProcess = [System.Diagnostics.Process]::Start($RegProcessStartInfo); $null = $RegProcess.WaitForExit(10000)
+        return $RegProcess.ExitCode
     }
     function Invoke-WithOfflineHive {
         param([string]$ProfileSID, [string]$ProfileDirectoryPath, [scriptblock]$ActionToPerform)
         $NtUserDatFilePath = [IO.Path]::Combine($ProfileDirectoryPath, 'NTUSER.DAT')
         if (-not [IO.File]::Exists($NtUserDatFilePath)) { return $false }
         $LoadedHiveRegistryPath = $null; $HiveRequiresUnload = $false
-        if ($ProfileSID -ne 'Default') {
-            try { $AlreadyLoadedTestKey = [Microsoft.Win32.Registry]::Users.OpenSubKey("$ProfileSID\$TaskBandRegistrySubKey", $false); if ($AlreadyLoadedTestKey) { $LoadedHiveRegistryPath = $ProfileSID; $AlreadyLoadedTestKey.Close() } } catch { }
-        }
+        if ($ProfileSID -ne 'Default' -and (Test-RegistrySubKeyExists ([Microsoft.Win32.Registry]::Users) "$ProfileSID\$TaskBandRegistrySubKey")) { $LoadedHiveRegistryPath = $ProfileSID }
         if (-not $LoadedHiveRegistryPath) {
             $TemporaryHiveName = "TempPin_$($ProfileSID.Replace('-','').Substring(0, [Math]::Min(12, $ProfileSID.Replace('-','').Length)))"
-            $RegLoadProcessInfo = New-Object System.Diagnostics.ProcessStartInfo; $RegLoadProcessInfo.FileName = 'reg.exe'
-            $RegLoadProcessInfo.Arguments = "load `"HKU\$TemporaryHiveName`" `"$NtUserDatFilePath`""
-            $RegLoadProcessInfo.UseShellExecute = $false; $RegLoadProcessInfo.CreateNoWindow = $true; $RegLoadProcessInfo.RedirectStandardError = $true
-            $RegLoadProcess = [System.Diagnostics.Process]::Start($RegLoadProcessInfo); $RegLoadProcess.WaitForExit(10000)
-            if ($RegLoadProcess.ExitCode -ne 0) { return $false }
+            if ((Invoke-RegistryExecutable "load `"HKU\$TemporaryHiveName`" `"$NtUserDatFilePath`"") -ne 0) { return $false }
             $LoadedHiveRegistryPath = $TemporaryHiveName; $HiveRequiresUnload = $true
         }
         try {
@@ -472,110 +608,103 @@ public class TaskbarPin {
         } finally {
             if ($HiveRequiresUnload) {
                 [GC]::Collect(); [GC]::WaitForPendingFinalizers(); Start-Sleep -Milliseconds 200
-                $RegUnloadProcessInfo = New-Object System.Diagnostics.ProcessStartInfo; $RegUnloadProcessInfo.FileName = 'reg.exe'
-                $RegUnloadProcessInfo.Arguments = "unload `"HKU\$TemporaryHiveName`""
-                $RegUnloadProcessInfo.UseShellExecute = $false; $RegUnloadProcessInfo.CreateNoWindow = $true; $RegUnloadProcessInfo.RedirectStandardError = $true
-                $RegUnloadProcess = [System.Diagnostics.Process]::Start($RegUnloadProcessInfo); $RegUnloadProcess.WaitForExit(10000)
+                $null = Invoke-RegistryExecutable "unload `"HKU\$TemporaryHiveName`""
             }
         }
         return $true
+    }
+    function Find-MatchingPins {
+        param([string]$PinnedShortcutDirectory, [string[]]$PatternsToMatch)
+        $MatchedShortcutPaths = @()
+        foreach ($PinnedShortcutEntry in @([TaskbarPin]::GetLnkCatalog($PinnedShortcutDirectory, $false, 0))) {
+            foreach ($Pattern in $PatternsToMatch) {
+                $ShortcutTargetPath = $PinnedShortcutEntry.TargetPath
+                if ($Pattern -match '[/\\]') {
+                    $PatternMatched = [bool]($ShortcutTargetPath -and $ShortcutTargetPath -like $Pattern)
+                } else {
+                    $PatternMatched = ($PinnedShortcutEntry.DisplayName -like $Pattern) -or
+                                      ($ShortcutTargetPath -and ([IO.Path]::GetFileNameWithoutExtension($ShortcutTargetPath) -like $Pattern -or [IO.Path]::GetFileName($ShortcutTargetPath) -like $Pattern)) -or
+                                      ($PinnedShortcutEntry.Aumid -and $PinnedShortcutEntry.Aumid -like $Pattern)
+                }
+                if ($PatternMatched) { $MatchedShortcutPaths += $PinnedShortcutEntry.LnkPath; break }
+            }
+        }
+        return $MatchedShortcutPaths
+    }
+    function Invoke-UnpinFromBlob {
+        param($RegistryKeyHandle, [string[]]$ShortcutFilenamesToRemove)
+        $FavoritesBlob        = $RegistryKeyHandle.GetValue('Favorites', $null, $DoNotExpandRegistryOption)
+        $FavoritesResolveBlob = $RegistryKeyHandle.GetValue('FavoritesResolve', $null, $DoNotExpandRegistryOption)
+        if (-not $FavoritesBlob -or $FavoritesBlob.Length -lt 6) { return }
+        $EntriesToRemove = @()
+        foreach ($ShortcutFilename in $ShortcutFilenamesToRemove) {
+            $FoundBlobIndex = [TaskbarPin]::FindBlobEntry($FavoritesBlob, $ShortcutFilename)
+            if ($FoundBlobIndex -ge 0) { $EntriesToRemove += @{ Name = $ShortcutFilename; Index = $FoundBlobIndex } }
+        }
+        foreach ($EntryToRemove in @($EntriesToRemove | Sort-Object { $_.Index } -Descending)) {
+            $FavoritesBlob = [TaskbarPin]::RemoveFavEntry($FavoritesBlob, $EntryToRemove.Index)
+            if ($FavoritesResolveBlob) { $FavoritesResolveBlob = [TaskbarPin]::RemoveResEntry($FavoritesResolveBlob, $EntryToRemove.Index) }
+        }
+        if ($EntriesToRemove.Count -gt 0) {
+            $CurrentFavoritesChanges = [int]$RegistryKeyHandle.GetValue('FavoritesChanges', 0, $DoNotExpandRegistryOption)
+            $RegistryKeyHandle.SetValue('Favorites', ([byte[]]$FavoritesBlob), $BinaryRegistryValueKind)
+            if ($FavoritesResolveBlob) { $RegistryKeyHandle.SetValue('FavoritesResolve', ([byte[]]$FavoritesResolveBlob), $BinaryRegistryValueKind) }
+            $RegistryKeyHandle.SetValue('FavoritesVersion',  3,                                $DwordRegistryValueKind)
+            $RegistryKeyHandle.SetValue('FavoritesChanges', ($CurrentFavoritesChanges + 1),    $DwordRegistryValueKind)
+        }
+        return $EntriesToRemove.Count
     }
     #region UNPIN FLOW
     if ($Unpin) {
         $UnpinMatchPatterns = @()
         foreach ($InputItem in $ParsedInputItems) {
-            if ($InputItem.StartsWith('shell:AppsFolder\', [StringComparison]::OrdinalIgnoreCase)) { $UnpinMatchPatterns += $InputItem.Substring(17) }
-            else {
-                $InputHasDirectoryPart = $InputItem.Contains('\') -or $InputItem.Contains('/')
-                $InputHasWildcard      = $InputItem.Contains('*') -or $InputItem.Contains('?')
-                if ($InputHasDirectoryPart -and -not $InputHasWildcard) {
-                    $InputExtension = [IO.Path]::GetExtension($InputItem).ToLower()
-                    if ($InputExtension -eq '.cpl' -and [IO.File]::Exists($InputItem)) {
+            if ($InputItem.StartsWith('shell:AppsFolder\', [StringComparison]::OrdinalIgnoreCase)) { $UnpinMatchPatterns += $InputItem.Substring(17); continue }
+            $InputHasWildcard = $InputItem -match '[*?]'
+            $InputExtension   = [IO.Path]::GetExtension($InputItem).ToLower()
+            if ($InputExtension -eq '.cpl' -and -not $InputHasWildcard) {
+                $CplResolvedPattern = $null
+                foreach ($ResolvedCplPath in @(Resolve-FilesystemInput $InputItem)) {
+                    if ($ResolvedCplPath -and [IO.File]::Exists($ResolvedCplPath)) {
                         Initialize-NativeHelper
-                        $CplMatch = Resolve-CplControlPanelItem $InputItem
-                        if ($CplMatch) { $UnpinMatchPatterns += ($CplMatch.Name -replace '[<>:"/\\|?*]', '_') }
-                        else           { $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem) }
-                    } else {
-                        $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem)
+                        $CplMatch = Resolve-CplControlPanelItem $ResolvedCplPath
+                        if ($CplMatch) { $CplResolvedPattern = $CplMatch.Name -replace '[<>:"/\\|?*]', '_'; break }
                     }
                 }
-                else {
-                    $InputExtension = [IO.Path]::GetExtension($InputItem).ToLower()
-                    if ($InputExtension -eq '.cpl') {
-                        $ResolvedCplPaths = @(Resolve-FilesystemInput $InputItem)
-                        $CplHandled = $false
-                        foreach ($ResolvedCplPath in $ResolvedCplPaths) {
-                            if ($ResolvedCplPath -and [IO.File]::Exists($ResolvedCplPath)) {
-                                Initialize-NativeHelper
-                                $CplMatch = Resolve-CplControlPanelItem $ResolvedCplPath
-                                if ($CplMatch) { $UnpinMatchPatterns += ($CplMatch.Name -replace '[<>:"/\\|?*]', '_'); $CplHandled = $true }
+                if ($CplResolvedPattern) { $UnpinMatchPatterns += $CplResolvedPattern }
+                else { $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem) }
+            } else {
+                # Baseline pattern : same behavior as before so explicit and wildcard patterns keep working.
+                if (($InputItem -match '[/\\]' -and -not $InputHasWildcard) -or $InputExtension -eq '.msc' -or $InputExtension -eq '.exe') { $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem) }
+                else { $UnpinMatchPatterns += $InputItem }
+                # Mirror the pin resolution : a pinned shortcut may carry the basename of a file
+                # the input resolved to (wildcard expansion included), or the display name and
+                # AUMID of the application identity an executable or a bare name was pinned
+                # under. AUMID-based shortcuts have no target path, so without these patterns
+                # they can never be matched back from the original input.
+                $ResolvedUnpinPaths = @(Resolve-FilesystemInput $InputItem)
+                if ($ResolvedUnpinPaths.Count -gt 0) {
+                    foreach ($ResolvedUnpinPath in $ResolvedUnpinPaths) {
+                        $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($ResolvedUnpinPath)
+                        if ([IO.Path]::GetExtension($ResolvedUnpinPath).ToLower() -eq '.exe') {
+                            $UnpinExecutableIdentity = Resolve-ExecutableIdentity $ResolvedUnpinPath
+                            if ($UnpinExecutableIdentity) {
+                                $UnpinMatchPatterns += ($UnpinExecutableIdentity.DisplayName -replace '[<>:"/\\|?*]', '_')
+                                $UnpinMatchPatterns += $UnpinExecutableIdentity.Aumid
                             }
                         }
-                        if (-not $CplHandled) { $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem) }
                     }
-                    elseif ($InputExtension -eq '.msc' -or $InputExtension -eq '.exe') {
-                        $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem)
+                } elseif ($InputItem -notmatch '[/\\]') {
+                    foreach ($UnpinApplicationMatch in @(Find-ApplicationMatches $InputItem)) {
+                        $UnpinMatchPatterns += ($UnpinApplicationMatch.DisplayName -replace '[<>:"/\\|?*]', '_')
+                        if ($UnpinApplicationMatch.Kind -eq 'Aumid') { $UnpinMatchPatterns += $UnpinApplicationMatch.Aumid }
                     }
-                    else { $UnpinMatchPatterns += $InputItem }
                 }
             }
         }
-        $DisplayPatternLabel = ($UnpinMatchPatterns | ForEach-Object { $_ }) -join ', '
+        $UnpinMatchPatterns = @($UnpinMatchPatterns | Where-Object { $_ } | Select-Object -Unique)
+        $DisplayPatternLabel = $UnpinMatchPatterns -join ', '
         Write-Banner 'UNPIN' 'DarkRed' "$DisplayPatternLabel$(if ($AllUsers) { ' (AllUsers)' })"
         Initialize-NativeHelper
-        function Find-MatchingPins {
-            param([string]$PinnedShortcutDirectory, [string[]]$PatternsToMatch)
-            $MatchedShortcutPaths = @(); $WshShellInstance = $null
-            try { $ShortcutFilesInDirectory = @([IO.Directory]::GetFiles($PinnedShortcutDirectory, '*.lnk')) } catch { return @() }
-            foreach ($ShortcutFilePath in $ShortcutFilesInDirectory) {
-                $ShortcutFileName = [IO.Path]::GetFileName($ShortcutFilePath); $PatternMatched = $false
-                foreach ($Pattern in $PatternsToMatch) {
-                    $PatternIsFullPath = $Pattern.Contains('\') -or $Pattern.Contains('/')
-                    if (-not $PatternIsFullPath -and [IO.Path]::GetFileNameWithoutExtension($ShortcutFileName) -like $Pattern) { $PatternMatched = $true; break }
-                }
-                if (-not $PatternMatched) {
-                    if (-not $WshShellInstance) { $WshShellInstance = New-Object -ComObject WScript.Shell }
-                    $ShortcutComObject = $WshShellInstance.CreateShortcut($ShortcutFilePath); $ShortcutTargetPath = $ShortcutComObject.TargetPath
-                    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShortcutComObject)
-                    foreach ($Pattern in $PatternsToMatch) {
-                        $PatternIsFullPath = $Pattern.Contains('\') -or $Pattern.Contains('/')
-                        if (-not $PatternIsFullPath) { if ($ShortcutTargetPath -and ([IO.Path]::GetFileNameWithoutExtension($ShortcutTargetPath) -like $Pattern -or [IO.Path]::GetFileName($ShortcutTargetPath) -like $Pattern)) { $PatternMatched = $true; break } }
-                        else { if ($ShortcutTargetPath -like $Pattern) { $PatternMatched = $true; break } }
-                    }
-                    if (-not $PatternMatched) {
-                        $ShortcutAumid = [TaskbarPin]::GetAumid($ShortcutFilePath)
-                        if ($ShortcutAumid) { foreach ($Pattern in $PatternsToMatch) { if ($ShortcutAumid -like $Pattern) { $PatternMatched = $true; break } } }
-                    }
-                }
-                if ($PatternMatched) { $MatchedShortcutPaths += $ShortcutFilePath }
-            }
-            if ($WshShellInstance) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($WshShellInstance) }
-            return $MatchedShortcutPaths
-        }
-        function Invoke-UnpinFromBlob {
-            param($RegistryKeyHandle, [string[]]$ShortcutFilenamesToRemove)
-            $FavoritesBlob        = $RegistryKeyHandle.GetValue('Favorites', $null, $DoNotExpandRegistryOption)
-            $FavoritesResolveBlob = $RegistryKeyHandle.GetValue('FavoritesResolve', $null, $DoNotExpandRegistryOption)
-            if (-not $FavoritesBlob -or $FavoritesBlob.Length -lt 6) { return }
-            $EntriesToRemove = @()
-            foreach ($ShortcutFilename in $ShortcutFilenamesToRemove) {
-                $FoundBlobIndex = [TaskbarPin]::FindBlobEntry($FavoritesBlob, $ShortcutFilename)
-                if ($FoundBlobIndex -ge 0) { $EntriesToRemove += New-Object PSObject -Property @{ Name = $ShortcutFilename; Index = $FoundBlobIndex } }
-            }
-            $EntriesToRemove = @($EntriesToRemove | Sort-Object -Property Index -Descending)
-            foreach ($EntryToRemove in $EntriesToRemove) {
-                $FavoritesBlob = [TaskbarPin]::RemoveFavEntry($FavoritesBlob, $EntryToRemove.Index)
-                if ($FavoritesResolveBlob) { $FavoritesResolveBlob = [TaskbarPin]::RemoveResEntry($FavoritesResolveBlob, $EntryToRemove.Index) }
-            }
-            if ($EntriesToRemove.Count -gt 0) {
-                $CurrentFavoritesChanges = [int]$RegistryKeyHandle.GetValue('FavoritesChanges', 0, $DoNotExpandRegistryOption)
-                $RegistryKeyHandle.SetValue('Favorites', ([byte[]]$FavoritesBlob), $BinaryRegistryValueKind)
-                if ($FavoritesResolveBlob) { $RegistryKeyHandle.SetValue('FavoritesResolve', ([byte[]]$FavoritesResolveBlob), $BinaryRegistryValueKind) }
-                $RegistryKeyHandle.SetValue('FavoritesVersion',  3,                                $DwordRegistryValueKind)
-                $RegistryKeyHandle.SetValue('FavoritesChanges', ($CurrentFavoritesChanges + 1),    $DwordRegistryValueKind)
-            }
-            return $EntriesToRemove.Count
-        }
         $PinnedDirectoriesToScan = @()
         if ($TaskBarDirectoryExists)     { $PinnedDirectoriesToScan += $TaskBarPinnedDirectory }
         if ($QuickLaunchDirectoryExists) { $PinnedDirectoriesToScan += $QuickLaunchDirectory }
@@ -614,61 +743,76 @@ public class TaskbarPin {
     Write-Banner 'PIN' 'DarkBlue' "$Pin$(if ($AllUsers) { ' (AllUsers)' })"
     $UwpInputItems        = @($ParsedInputItems | Where-Object {     $_.StartsWith('shell:AppsFolder\', [StringComparison]::OrdinalIgnoreCase) })
     $FilesystemInputItems = @($ParsedInputItems | Where-Object { -not $_.StartsWith('shell:AppsFolder\', [StringComparison]::OrdinalIgnoreCase) })
-    $ResolvedPinTargets     = @()
-    $ShellApplicationCom    = $null
-    $AppsFolderNamespaceCom = $null
+    $ResolvedPinTargets               = @()
+    $AlreadyResolvedApplicationAumids = @{}
+    $AlreadySeenFilesystemPaths       = @{}
     if ($UwpInputItems.Count -gt 0) {
-        $ShellApplicationCom    = New-Object -ComObject Shell.Application
-        $AppsFolderNamespaceCom = $ShellApplicationCom.Namespace('shell:AppsFolder')
-        $AlreadySeenAumids = @{}
-        $ExactAumidInputs  = @($UwpInputItems | Where-Object { $_ -notmatch '[*?]' -and $_.Contains('!') })
-        $WildcardUwpInputs = @($UwpInputItems | Where-Object { $_    -match '[*?]' -or -not $_.Contains('!') })
-        foreach ($ExactUwpInput in $ExactAumidInputs) {
-            $AumidSuffix = $ExactUwpInput.Substring(17); if (-not $AumidSuffix) { continue }
-            $DirectlyResolvedAppItem = $AppsFolderNamespaceCom.ParseName($AumidSuffix)
-            if ($DirectlyResolvedAppItem) {
-                if (-not $AlreadySeenAumids.ContainsKey($DirectlyResolvedAppItem.Path)) {
-                    $AlreadySeenAumids[$DirectlyResolvedAppItem.Path] = $true
-                    $ResolvedPinTargets += New-Object PSObject -Property @{ PinType = 'UWP'; Aumid = $DirectlyResolvedAppItem.Path; DisplayName = $DirectlyResolvedAppItem.Name }
-                }
-                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($DirectlyResolvedAppItem)
-            } else { Write-Console "  [!] Not found : $ExactUwpInput" -Color Yellow }
+        $ExactAumidInputs = @($UwpInputItems | Where-Object { $_ -notmatch '[*?]' -and $_.Contains('!') })
+        $PatternUwpInputs = @($UwpInputItems | Where-Object { $_ -match '[*?]' -or -not $_.Contains('!') })
+        if ($ExactAumidInputs.Count -gt 0) {
+            $ShellApplicationCom    = New-Object -ComObject Shell.Application
+            $AppsFolderNamespaceCom = $ShellApplicationCom.Namespace('shell:AppsFolder')
+            foreach ($ExactUwpInput in $ExactAumidInputs) {
+                $ResolvedAppItem = $AppsFolderNamespaceCom.ParseName($ExactUwpInput.Substring(17))
+                if ($ResolvedAppItem) {
+                    if (-not $AlreadyResolvedApplicationAumids.ContainsKey($ResolvedAppItem.Path)) {
+                        $AlreadyResolvedApplicationAumids[$ResolvedAppItem.Path] = $true
+                        $ResolvedPinTargets += @{ PinType = 'UWP'; Aumid = $ResolvedAppItem.Path; DisplayName = $ResolvedAppItem.Name }
+                    }
+                    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ResolvedAppItem)
+                } else { Write-Console "  [!] Not found : $ExactUwpInput" -Color Yellow }
+            }
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($AppsFolderNamespaceCom)
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShellApplicationCom)
         }
-        if ($WildcardUwpInputs.Count -gt 0) {
-            $WildcardSuffixes = @($WildcardUwpInputs | ForEach-Object { $_.Substring(17) } | Where-Object { $_ })
-            $AllInstalledAppItems = @($AppsFolderNamespaceCom.Items()); $MatchedWildcardSuffixes = @{}
-            foreach ($AppItem in $AllInstalledAppItems) {
-                foreach ($WildcardPattern in $WildcardSuffixes) {
-                    if (($AppItem.Name -like $WildcardPattern -or $AppItem.Path -like $WildcardPattern) -and -not $AlreadySeenAumids.ContainsKey($AppItem.Path)) {
-                        $AlreadySeenAumids[$AppItem.Path] = $true
-                        $ResolvedPinTargets += New-Object PSObject -Property @{ PinType = 'UWP'; Aumid = $AppItem.Path; DisplayName = $AppItem.Name }
-                        $MatchedWildcardSuffixes[$WildcardPattern] = $true
+        foreach ($PatternUwpInput in $PatternUwpInputs) {
+            $UwpMatchPattern = $PatternUwpInput.Substring(17); if (-not $UwpMatchPattern) { continue }
+            $MatchedAnyApplication = $false
+            foreach ($ApplicationEntry in (Get-AppsFolderSnapshot)) {
+                if (($ApplicationEntry.DisplayName -like $UwpMatchPattern -or $ApplicationEntry.Aumid -like $UwpMatchPattern) -and -not $AlreadyResolvedApplicationAumids.ContainsKey($ApplicationEntry.Aumid)) {
+                    $AlreadyResolvedApplicationAumids[$ApplicationEntry.Aumid] = $true
+                    $ResolvedPinTargets += @{ PinType = 'UWP'; Aumid = $ApplicationEntry.Aumid; DisplayName = $ApplicationEntry.DisplayName }
+                    $MatchedAnyApplication = $true
+                }
+            }
+            if (-not $MatchedAnyApplication) { Write-Console "  [!] Not found : shell:AppsFolder\$UwpMatchPattern" -Color Yellow }
+        }
+    }
+    foreach ($FilesystemInput in $FilesystemInputItems) {
+        $ResolvedFilePaths = @(Resolve-FilesystemInput $FilesystemInput)
+        foreach ($ResolvedPath in $ResolvedFilePaths) {
+            if (-not $ResolvedPath -or $AlreadySeenFilesystemPaths.ContainsKey($ResolvedPath)) { continue }
+            $AlreadySeenFilesystemPaths[$ResolvedPath] = $true
+            $ExecutableIdentity = $null
+            if ([IO.Path]::GetExtension($ResolvedPath).ToLower() -eq '.exe') { $ExecutableIdentity = Resolve-ExecutableIdentity $ResolvedPath }
+            if ($ExecutableIdentity) {
+                if (-not $AlreadyResolvedApplicationAumids.ContainsKey($ExecutableIdentity.Aumid)) {
+                    $AlreadyResolvedApplicationAumids[$ExecutableIdentity.Aumid] = $true
+                    $ResolvedPinTargets += @{ PinType = 'UWP'; Aumid = $ExecutableIdentity.Aumid; DisplayName = $ExecutableIdentity.DisplayName }
+                }
+            } else {
+                $ResolvedPinTargets += @{ PinType = 'FS'; ResolvedPath = $ResolvedPath }
+            }
+        }
+        if ($ResolvedFilePaths.Count -eq 0) {
+            $ApplicationMatches = @()
+            if ($FilesystemInput -notmatch '[/\\]') { $ApplicationMatches = @(Find-ApplicationMatches $FilesystemInput) }
+            if ($ApplicationMatches.Count -gt 0) {
+                foreach ($ApplicationMatch in $ApplicationMatches) {
+                    if ($ApplicationMatch.Kind -eq 'Aumid') {
+                        if ($AlreadyResolvedApplicationAumids.ContainsKey($ApplicationMatch.Aumid)) { continue }
+                        $AlreadyResolvedApplicationAumids[$ApplicationMatch.Aumid] = $true
+                        $ResolvedPinTargets += @{ PinType = 'UWP'; Aumid = $ApplicationMatch.Aumid; DisplayName = $ApplicationMatch.DisplayName }
+                    } else {
+                        if ($AlreadySeenFilesystemPaths.ContainsKey($ApplicationMatch.LnkPath)) { continue }
+                        $AlreadySeenFilesystemPaths[$ApplicationMatch.LnkPath] = $true
+                        $ResolvedPinTargets += @{ PinType = 'FS'; ResolvedPath = $ApplicationMatch.LnkPath }
                     }
                 }
-                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($AppItem)
-            }
-            foreach ($WildcardPattern in $WildcardSuffixes) { if (-not $MatchedWildcardSuffixes.ContainsKey($WildcardPattern)) { Write-Console "  [!] Not found : shell:AppsFolder\$WildcardPattern" -Color Yellow } }
+            } else { Write-Console "  [!] Not found : $FilesystemInput" -Color Yellow }
         }
     }
-    if ($FilesystemInputItems.Count -gt 0) {
-        $AlreadySeenFilesystemPaths = @{}
-        foreach ($FilesystemInput in $FilesystemInputItems) {
-            $ResolvedFilePaths = @(Resolve-FilesystemInput $FilesystemInput)
-            foreach ($ResolvedPath in $ResolvedFilePaths) {
-                if ($ResolvedPath -and -not $AlreadySeenFilesystemPaths.ContainsKey($ResolvedPath)) {
-                    $AlreadySeenFilesystemPaths[$ResolvedPath] = $true
-                    $ResolvedPinTargets += New-Object PSObject -Property @{ PinType = 'FS'; ResolvedPath = $ResolvedPath }
-                }
-            }
-            if ($ResolvedFilePaths.Count -eq 0) { Write-Console "  [!] Not found : $FilesystemInput" -Color Yellow }
-        }
-    }
-    if ($ResolvedPinTargets.Count -eq 0) {
-        Write-Console "  [X] No items found to pin" -Color Red; Write-Console ""
-        if ($AppsFolderNamespaceCom) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($AppsFolderNamespaceCom) }
-        if ($ShellApplicationCom)   { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShellApplicationCom) }
-        return
-    }
+    if ($ResolvedPinTargets.Count -eq 0) { Write-Console "  [X] No items found to pin" -Color Red; Write-Console ""; return }
     #region PIN : BLOB INJECTION
     $SuccessfullyPinnedCount      = 0
     $BlobEntriesReadyForInjection = @()
@@ -679,35 +823,24 @@ public class TaskbarPin {
         Initialize-NativeHelper
         $WshShellForPinCreation = $null
         foreach ($PinTarget in $ResolvedPinTargets) {
-            $DestinationLnkPath = $null; $Beef001dParsingName = $null; $SourceShortcutPath = $null; $ShortcutIsTemporary = $false; $PinTargetDisplayName = $null
+            $SourceShortcutPath = $null; $ShortcutIsTemporary = $false
             if ($PinTarget.PinType -eq 'UWP') {
-                $TargetAumid          = $PinTarget.Aumid; $PinTargetDisplayName = $PinTarget.DisplayName
-                $SafeShortcutName     = $PinTargetDisplayName -replace '[<>:"/\\|?*]', '_'
-                $DestinationLnkPath   = [IO.Path]::Combine($TaskBarPinnedDirectory, "$SafeShortcutName.lnk")
-                $Beef001dParsingName  = $TargetAumid
-                if ([IO.File]::Exists($DestinationLnkPath)) {
-                    $SerializedBlobEntry = [TaskbarPin]::GetBlobEntryEx($DestinationLnkPath, $Beef001dParsingName)
-                    if ($SerializedBlobEntry) {
-                        $BlobEntriesReadyForInjection += New-Object PSObject -Property @{
-                            DestinationLnkPath  = $DestinationLnkPath;  SerializedBlobEntry = $SerializedBlobEntry; DisplayName    = $PinTargetDisplayName
-                            ShortcutIsTemporary = $false;                SourceShortcutPath  = $null;                PinType        = 'UWP'
-                            Aumid               = $TargetAumid;          Beef001dContent     = $Beef001dParsingName
-                        }
-                        continue
+                $PinTargetDisplayName = $PinTarget.DisplayName
+                $Beef001dParsingName  = $PinTarget.Aumid
+                $DestinationLnkPath   = [IO.Path]::Combine($TaskBarPinnedDirectory, "$($PinTarget.DisplayName -replace '[<>:"/\\|?*]', '_').lnk")
+                if (-not [IO.File]::Exists($DestinationLnkPath)) {
+                    if (-not [TaskbarPin]::CreateAppShortcut($PinTarget.Aumid, $DestinationLnkPath)) {
+                        if ([IO.File]::Exists($DestinationLnkPath)) { try { [IO.File]::Delete($DestinationLnkPath) } catch { } }
+                        $ItemsDeferredToQuickLaunch += $PinTarget; continue
                     }
-                }
-                if (-not [TaskbarPin]::CreateAppShortcut($TargetAumid, $DestinationLnkPath)) {
-                    if ($DestinationLnkPath -and [IO.File]::Exists($DestinationLnkPath)) { try { [IO.File]::Delete($DestinationLnkPath) } catch { } }
-                    $ItemsDeferredToQuickLaunch += $PinTarget; continue
                 }
             } else {
                 $Beef001dContentReference = [ref]''
-                $SourceShortcutPath       = New-TargetShortcut $PinTarget.ResolvedPath $Beef001dContentReference ([ref]$WshShellForPinCreation)
-                $Beef001dParsingName      = $Beef001dContentReference.Value
-                $ShortcutIsTemporary      = ($SourceShortcutPath -ne $PinTarget.ResolvedPath)
-                $ShortcutFileName         = [IO.Path]::GetFileName($SourceShortcutPath)
-                $DestinationLnkPath       = [IO.Path]::Combine($TaskBarPinnedDirectory, $ShortcutFileName)
-                $PinTargetDisplayName     = $ShortcutFileName
+                $SourceShortcutPath   = New-TargetShortcut $PinTarget.ResolvedPath $Beef001dContentReference ([ref]$WshShellForPinCreation)
+                $Beef001dParsingName  = $Beef001dContentReference.Value
+                $ShortcutIsTemporary  = ($SourceShortcutPath -ne $PinTarget.ResolvedPath)
+                $PinTargetDisplayName = [IO.Path]::GetFileName($SourceShortcutPath)
+                $DestinationLnkPath   = [IO.Path]::Combine($TaskBarPinnedDirectory, $PinTargetDisplayName)
                 if (-not [IO.File]::Exists($DestinationLnkPath)) { [IO.File]::Copy($SourceShortcutPath, $DestinationLnkPath) }
             }
             $SerializedBlobEntry = $null
@@ -716,12 +849,7 @@ public class TaskbarPin {
                 else                     { $SerializedBlobEntry = [TaskbarPin]::GetBlobEntryEx($DestinationLnkPath, $Beef001dParsingName) }
             }
             if ($SerializedBlobEntry) {
-                $BlobEntriesReadyForInjection += New-Object PSObject -Property @{
-                    DestinationLnkPath  = $DestinationLnkPath;  SerializedBlobEntry = $SerializedBlobEntry; DisplayName    = $PinTargetDisplayName
-                    ShortcutIsTemporary = $ShortcutIsTemporary;  SourceShortcutPath  = $SourceShortcutPath;  PinType        = $PinTarget.PinType
-                    Aumid               = $(if ($PinTarget.PinType -eq 'UWP') { $PinTarget.Aumid } else { $null })
-                    Beef001dContent     = $Beef001dParsingName
-                }
+                $BlobEntriesReadyForInjection += @{ DestinationLnkPath = $DestinationLnkPath; SerializedBlobEntry = $SerializedBlobEntry; DisplayName = $PinTargetDisplayName; ShortcutIsTemporary = $ShortcutIsTemporary; SourceShortcutPath = $SourceShortcutPath; Beef001dContent = $Beef001dParsingName }
             } else {
                 if ($DestinationLnkPath -and [IO.File]::Exists($DestinationLnkPath)) { try { [IO.File]::Delete($DestinationLnkPath) } catch { } }
                 $ItemsDeferredToQuickLaunch += $PinTarget
@@ -747,23 +875,18 @@ public class TaskbarPin {
                 if ($ReadyEntry.ShortcutIsTemporary -and $ReadyEntry.SourceShortcutPath) { try { [IO.File]::Delete($ReadyEntry.SourceShortcutPath) } catch { } }
             }
             Write-Console ""
-    } else { $script:SuppressConsoleOutput = $false; Write-Console " nothing to inject" -Color Yellow; Write-Console "" }
+        } else { $script:SuppressConsoleOutput = $false; Write-Console " nothing to inject" -Color Yellow; Write-Console "" }
         if ($AllUsers -and $BlobEntriesReadyForInjection.Count -gt 0) {
             $AllUserProfiles = @(Get-UserProfiles); $AllUsersProfilesUpdatedCount = 0
             foreach ($UserProfile in $AllUserProfiles) {
                 $ProfileTaskBarDirectory = [IO.Path]::Combine($UserProfile.ProfilePath, $TaskBarRelativeProfilePath)
                 if (-not [IO.Directory]::Exists($ProfileTaskBarDirectory)) { try { $null = [IO.Directory]::CreateDirectory($ProfileTaskBarDirectory) } catch { continue } }
-                foreach ($ReadyEntry in $BlobEntriesReadyForInjection) {
-                    $SourceLnkPath      = $ReadyEntry.DestinationLnkPath
-                    $DestinationLnkPath = [IO.Path]::Combine($ProfileTaskBarDirectory, [IO.Path]::GetFileName($SourceLnkPath))
-                    if (-not [IO.File]::Exists($DestinationLnkPath)) { try { [IO.File]::Copy($SourceLnkPath, $DestinationLnkPath) } catch { } }
-                }
                 $ProfileSpecificBlobEntries = @()
                 foreach ($ReadyEntry in $BlobEntriesReadyForInjection) {
                     $ProfileShortcutPath = [IO.Path]::Combine($ProfileTaskBarDirectory, [IO.Path]::GetFileName($ReadyEntry.DestinationLnkPath))
-                    if (-not [IO.File]::Exists($ProfileShortcutPath)) { continue }
+                    if (-not [IO.File]::Exists($ProfileShortcutPath)) { try { [IO.File]::Copy($ReadyEntry.DestinationLnkPath, $ProfileShortcutPath) } catch { continue } }
                     $ProfileBlobEntry = [TaskbarPin]::GetBlobEntryFs($ProfileShortcutPath, $ReadyEntry.Beef001dContent)
-                    if ($ProfileBlobEntry) { $ProfileSpecificBlobEntries += New-Object PSObject -Property @{ DestinationLnkPath = $ProfileShortcutPath; SerializedBlobEntry = $ProfileBlobEntry } }
+                    if ($ProfileBlobEntry) { $ProfileSpecificBlobEntries += @{ DestinationLnkPath = $ProfileShortcutPath; SerializedBlobEntry = $ProfileBlobEntry } }
                 }
                 if ($ProfileSpecificBlobEntries.Count -eq 0) { continue }
                 $OfflineHiveResult = Invoke-WithOfflineHive $UserProfile.SID $UserProfile.ProfilePath {
@@ -773,17 +896,6 @@ public class TaskbarPin {
                 if ($OfflineHiveResult) { $AllUsersProfilesUpdatedCount++ }
             }
             Write-Console "  [*] AllUsers : $AllUsersProfilesUpdatedCount profile(s) updated" -Color DarkCyan; Write-Console ""
-        }
-        if ($BlobEntriesAddedCount -ge 10) {
-            [TaskbarPin]::SHChangeNotifyDrain()
-            for ($NormIdx = 0; $NormIdx -lt $BlobEntriesReadyForInjection.Count; $NormIdx += 9) {
-                $NormEnd = [Math]::Min($NormIdx + 9, $BlobEntriesReadyForInjection.Count)
-                for ($NormItem = $NormIdx; $NormItem -lt $NormEnd; $NormItem++) {
-                    [TaskbarPin]::SHChangeNotifyUpdateItem($BlobEntriesReadyForInjection[$NormItem].DestinationLnkPath)
-                }
-                [TaskbarPin]::SHChangeNotifyDrain()
-            }
-            Write-Console "  [fix] Normalization triggered for $($BlobEntriesReadyForInjection.Count) items" -Color DarkGray
         }
         $RemainingPinTargets = @($ItemsDeferredToQuickLaunch)
     } else { $RemainingPinTargets = @($ResolvedPinTargets) }
@@ -804,9 +916,7 @@ public class TaskbarPin {
         }
         if ($WshShellForFallback) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($WshShellForFallback) }
     }
-    #region CLEANUP AND RESULT
-    if ($AppsFolderNamespaceCom) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($AppsFolderNamespaceCom) }
-    if ($ShellApplicationCom)    { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShellApplicationCom) }
+    #region RESULT
     if ($SuccessfullyPinnedCount -gt 0) {
         Write-Banner 'OK' 'DarkGreen' "Pinned $SuccessfullyPinnedCount item(s)$(if ($AllUsers) { ' (AllUsers)' })"
         return
