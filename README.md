@@ -76,6 +76,9 @@ This tool writes directly to the taskbar's internal data structures with proper 
 
 # Unpin for all users
 .\Pin-Taskbar.ps1 -Unpin "Notepad*" -AllUsers
+
+# Unpin everything
+.\Pin-Taskbar.ps1 -Unpin * -AllUsers
 ```
 
 ### Via the .bat hybrid
