@@ -1,0 +1,9 @@
+Copyright © 2026 Freenitial from GitHub
+
+Free for personal use, internal tooling, and non-commercial projects.
+
+For commercial use, or business/enterprise context, a paid license is available. It includes:
+- Reverse engineering documentation.md (3k lines) covering how DLL files related to the taskbar work (blob format, COM vtables, notification chains, WFC gating, PIDL structures, etc.)
+- Support within reasonable limits
+
+Contact: freenitial@gmail.com
