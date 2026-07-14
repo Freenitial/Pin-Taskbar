@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Pin or unpin shortcuts from the Windows taskbar programmatically.
-    Version 1.4
+    Version 1.5
 .DESCRIPTION
     Pins or unpins items to/from the Windows taskbar across all Windows versions.
 
@@ -20,7 +20,10 @@
 .PARAMETER Pin
     Path to .lnk/.exe/.msc/.cpl, directory, bare application name, or shell:AppsFolder
     identifier. Supports semicolons and wildcards. A doubled semicolon ';;' escapes a
-    literal semicolon inside an item (some AUMIDs contain one).
+    literal semicolon inside an item (some AUMIDs contain one). A bare application name
+    resolves to a single application : exact display-name match first, otherwise an
+    elimination cascade narrows the substring matches down to one. An explicit wildcard
+    matches display names and AUMIDs and pins every match.
 .PARAMETER Unpin
     Triggers unpin mode. -Pin becomes a match pattern.
 .PARAMETER Silent
@@ -223,8 +226,10 @@ if ($AllUsers -and -not (Test-IsAdmin)) {
 #   CreateAppShortcut, CreatePidlShortcut : .lnk creation with PKEY_AppUserModel_ID through
 #                         raw COM vtable calls (IShellLink, IPropertyStore, IPersistFile).
 #   GetAumid            : reads the AUMID property from an existing .lnk via COM.
-#   GetLnkCatalog       : enumerates a directory and parses every .lnk binary natively,
-#                         returning ready-to-use LnkEntry objects (path, name, target, AUMID).
+#   GetLnkCatalog       : enumerates a directory (junction-safe manual recursion) and parses
+#                         every .lnk binary natively, returning ready-to-use LnkEntry objects
+#                         (path, name, target, AUMID, icon location).
+#   GetIconResourceCount: counts the icon resources of a file (0 = generic shell icon).
 function Initialize-NativeHelper {
     if ('TaskbarPin' -as [Type]) { return }
     Write-Log "[init] Compiling C# native helper..."
@@ -242,6 +247,7 @@ public class TaskbarPin {
     [DllImport("shell32.dll")] static extern void ILFree(IntPtr pidl);
     [DllImport("shell32.dll")] static extern IntPtr ILFindLastID(IntPtr pidl);
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHParseDisplayName(string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern uint ExtractIconExW(string lpszFile, int nIconIndex, IntPtr phiconLarge, IntPtr phiconSmall, uint nIcons);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr hWndParent, IntPtr hWndChildAfter, string lpszClass, string lpszWindow);
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
@@ -582,14 +588,15 @@ public class TaskbarPin {
     }
 
     // Parses the Shell Link binary format in a single pass, without any COM round-trip,
-    // extracting both the filesystem target path and the explicit AppUserModelID.
-    // Target resolution order : the LinkInfo local base path, then the
+    // extracting the filesystem target path, the explicit AppUserModelID and the icon
+    // location. Target resolution order : the LinkInfo local base path, then the
     // EnvironmentVariableDataBlock (0xA0000001) expanded, then the RelativePath StringData
     // entry resolved against the .lnk location. The AUMID comes from the
     // PropertyStoreDataBlock (0xA0000009), which is how UWP shortcuts and identity-aware
-    // desktop shortcuts carry their application identity.
-    static void ParseLnk(byte[] d, string lnkDirectory, out string target, out string aumid) {
-        target = ""; aumid = "";
+    // desktop shortcuts carry their application identity. The icon location comes from the
+    // IconLocation StringData entry, or the IconEnvironmentDataBlock (0xA0000007) fallback.
+    static void ParseLnk(byte[] d, string lnkDirectory, out string target, out string aumid, out string iconPath) {
+        target = ""; aumid = ""; iconPath = "";
         if (d.Length < 0x4C || BitConverter.ToInt32(d, 0) != 0x4C) return;
         uint flags = BitConverter.ToUInt32(d, 20);
         int pos = 0x4C;
@@ -613,10 +620,10 @@ public class TaskbarPin {
             }
             pos = li + (int)liSize;
         }
-        // Walk the StringData section, capturing the RelativePath entry (flag 0x08) on the
-        // way : shortcuts written without a LinkInfo block often store their target only as
-        // a path relative to the .lnk location. StringData strings are not null-terminated;
-        // the leading uint16 is the character count.
+        // Walk the StringData section, capturing the RelativePath entry (flag 0x08) and the
+        // IconLocation entry (flag 0x40) on the way : shortcuts written without a LinkInfo
+        // block often store their target only as a path relative to the .lnk location.
+        // StringData strings are not null-terminated; the leading uint16 is the char count.
         bool isUnicode = (flags & 0x80) != 0;               // IsUnicode
         string relativePath = "";
         uint[] stringDataFlags = new uint[] { 0x04, 0x08, 0x10, 0x20, 0x40 };
@@ -629,6 +636,10 @@ public class TaskbarPin {
             if (stringDataFlags[i] == 0x08) {               // HasRelativePath
                 relativePath = isUnicode ? System.Text.Encoding.Unicode.GetString(d, pos + 2, byteCount)
                                          : System.Text.Encoding.Default.GetString(d, pos + 2, byteCount);
+            }
+            else if (stringDataFlags[i] == 0x40) {          // HasIconLocation
+                iconPath = isUnicode ? System.Text.Encoding.Unicode.GetString(d, pos + 2, byteCount)
+                                     : System.Text.Encoding.Default.GetString(d, pos + 2, byteCount);
             }
             pos += 2 + byteCount;
         }
@@ -645,11 +656,51 @@ public class TaskbarPin {
             if (blockSig == 0xA0000009 && aumid.Length == 0) {
                 aumid = ReadStoreAumid(d, pos + 8, pos + (int)blockSize);
             }
+            if (blockSig == 0xA0000007 && iconPath.Length == 0 && blockSize >= 8 + 260 + 520) {
+                string envIconPath = ReadUniZ(d, pos + 8 + 260);
+                if (envIconPath.Length == 0) envIconPath = ReadAnsiZ(d, pos + 8);
+                if (envIconPath.Length > 0) iconPath = envIconPath;
+            }
             pos += (int)blockSize;
         }
+        if (iconPath.Length > 0) iconPath = Environment.ExpandEnvironmentVariables(iconPath);
         // Last resort : resolve the relative path against the .lnk location
         if (target.Length == 0 && relativePath.Length > 0 && lnkDirectory.Length > 0) {
             try { target = System.IO.Path.GetFullPath(System.IO.Path.Combine(lnkDirectory, relativePath)); } catch { }
+        }
+    }
+
+    // Returns the number of icon resources embedded in a file, 0 for missing or icon-less
+    // files. An icon-less source means the shell synthesizes a generic rendering for it.
+    public static int GetIconResourceCount(string filePath) {
+        if (!System.IO.File.Exists(filePath)) return 0;
+        uint iconResourceCount = ExtractIconExW(filePath, -1, IntPtr.Zero, IntPtr.Zero, 0);
+        if (iconResourceCount == 0xFFFFFFFF) return 0;
+        return (int)iconResourceCount;
+    }
+
+    // Adds the .lnk files of one directory. The Win32 3-character-extension quirk makes
+    // GetFiles("*.lnk") also return .lnk* files (.lnkbak...), hence the exact-suffix test.
+    static void AddLnkFiles(string directory, System.Collections.Generic.List<string> lnkPaths) {
+        string[] matchedFiles;
+        try { matchedFiles = System.IO.Directory.GetFiles(directory, "*.lnk"); } catch { return; }
+        for (int i = 0; i < matchedFiles.Length; i++) {
+            if (matchedFiles[i].EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) lnkPaths.Add(matchedFiles[i]);
+        }
+    }
+
+    // Collects the .lnk files of a directory tree by manual recursion : reparse points are
+    // skipped (the localized Start Menu compatibility junctions deny access by design, and
+    // a single one aborts an AllDirectories enumeration wholesale) and unreadable folders
+    // are ignored instead of discarding the whole walk.
+    static void CollectLnkFiles(string directory, System.Collections.Generic.List<string> lnkPaths) {
+        AddLnkFiles(directory, lnkPaths);
+        string[] subDirectories;
+        try { subDirectories = System.IO.Directory.GetDirectories(directory); } catch { return; }
+        for (int i = 0; i < subDirectories.Length; i++) {
+            try { if ((System.IO.File.GetAttributes(subDirectories[i]) & System.IO.FileAttributes.ReparsePoint) != 0) continue; }
+            catch { continue; }
+            CollectLnkFiles(subDirectories[i], lnkPaths);
         }
     }
 
@@ -658,24 +709,23 @@ public class TaskbarPin {
     // code, so the caller pays a single interop transition for the whole directory and
     // receives ready-to-use objects instead of building one per file.
     public static LnkEntry[] GetLnkCatalog(string directory, bool recurse, int rank) {
-        string[] files;
-        try {
-            files = System.IO.Directory.GetFiles(directory, "*.lnk",
-                recurse ? System.IO.SearchOption.AllDirectories : System.IO.SearchOption.TopDirectoryOnly);
-        } catch { return new LnkEntry[0]; }
-        LnkEntry[] entries = new LnkEntry[files.Length];
-        for (int i = 0; i < files.Length; i++) {
+        System.Collections.Generic.List<string> files = new System.Collections.Generic.List<string>();
+        if (recurse) CollectLnkFiles(directory, files);
+        else AddLnkFiles(directory, files);
+        LnkEntry[] entries = new LnkEntry[files.Count];
+        for (int i = 0; i < files.Count; i++) {
             LnkEntry entry    = new LnkEntry();
             entry.LnkPath     = files[i];
             entry.DisplayName = System.IO.Path.GetFileNameWithoutExtension(files[i]);
             entry.Rank        = rank;
-            string target = ""; string aumid = "";
+            string target = ""; string aumid = ""; string iconPath = "";
             try {
                 byte[] d = System.IO.File.ReadAllBytes(files[i]);
-                ParseLnk(d, System.IO.Path.GetDirectoryName(files[i]), out target, out aumid);
+                ParseLnk(d, System.IO.Path.GetDirectoryName(files[i]), out target, out aumid, out iconPath);
             } catch { }
             entry.TargetPath = target;
             entry.Aumid      = aumid;
+            entry.IconPath   = iconPath;
             entries[i] = entry;
         }
         return entries;
@@ -689,6 +739,7 @@ public class LnkEntry {
     public string DisplayName;
     public string TargetPath;
     public string Aumid;
+    public string IconPath;
     public int Rank;
 }
 '@
@@ -809,24 +860,30 @@ function Get-AppsFolderSnapshot {
 
 # Builds and caches a catalog of .lnk shortcuts from the application shortcut locations,
 # searched by priority rank : 1 = Start Menu (machine-wide and primary user), 2 = Quick
-# Launch. In AllUsers mode the Start Menu and Quick Launch of every other profile are
-# included. Enumeration, parsing and entry construction all happen in native code through
-# GetLnkCatalog, which returns ready-to-use LnkEntry objects. Quick Launch is scanned
-# non-recursively so the User Pinned subdirectory stays out of scope.
+# Launch. The Start Menu is indexed from its ROOT rather than its Programs subfolder :
+# some installers create their group directly at that level (the shell's Apps list also
+# reads both levels), and GetLnkCatalog's manual recursion skips the localized
+# compatibility junctions living there. The paths are composed from environment variables
+# because the CommonPrograms/CommonStartMenu SpecialFolder values do not exist on .NET
+# 3.5, where PowerShell 2.0 runs. In AllUsers mode the Start Menu and Quick Launch of
+# every other profile are included. Enumeration, parsing and entry construction all happen
+# in native code through GetLnkCatalog, which returns ready-to-use LnkEntry objects.
+# Quick Launch is scanned non-recursively so the User Pinned subdirectory stays out of scope.
 $script:ShortcutCatalog = $null
 function Get-ShortcutCatalog {
     if ($null -ne $script:ShortcutCatalog) { return $script:ShortcutCatalog }
     Initialize-NativeHelper
-    $PrimaryUserProgramsDirectory = if ($IsRunningCrossUser -and $InteractiveUserProfilePath) { [IO.Path]::Combine($InteractiveUserProfilePath, 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs') } else { [Environment]::GetFolderPath('Programs') }
+    $StartMenuRelativeProfilePath  = 'AppData\Roaming\Microsoft\Windows\Start Menu'
+    $PrimaryUserStartMenuDirectory = if ($IsRunningCrossUser -and $InteractiveUserProfilePath) { [IO.Path]::Combine($InteractiveUserProfilePath, $StartMenuRelativeProfilePath) } else { [IO.Path]::Combine($env:APPDATA, 'Microsoft\Windows\Start Menu') }
     $ShortcutSearchRoots = @(
-        @{ Directory = [Environment]::GetFolderPath('CommonPrograms'); Rank = 1; Recurse = $true },
-        @{ Directory = $PrimaryUserProgramsDirectory;                  Rank = 1; Recurse = $true },
-        @{ Directory = $QuickLaunchDirectory;                          Rank = 2; Recurse = $false }
+        @{ Directory = [IO.Path]::Combine($env:ProgramData, 'Microsoft\Windows\Start Menu'); Rank = 1; Recurse = $true },
+        @{ Directory = $PrimaryUserStartMenuDirectory;                                       Rank = 1; Recurse = $true },
+        @{ Directory = $QuickLaunchDirectory;                                                Rank = 2; Recurse = $false }
     )
     if ($AllUsers) {
         foreach ($UserProfile in @(Get-UserProfiles)) {
-            $ShortcutSearchRoots += @{ Directory = [IO.Path]::Combine($UserProfile.ProfilePath, 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'); Rank = 1; Recurse = $true }
-            $ShortcutSearchRoots += @{ Directory = [IO.Path]::Combine($UserProfile.ProfilePath, $QuickLaunchRelativePath);                                Rank = 2; Recurse = $false }
+            $ShortcutSearchRoots += @{ Directory = [IO.Path]::Combine($UserProfile.ProfilePath, $StartMenuRelativeProfilePath); Rank = 1; Recurse = $true }
+            $ShortcutSearchRoots += @{ Directory = [IO.Path]::Combine($UserProfile.ProfilePath, $QuickLaunchRelativePath);      Rank = 2; Recurse = $false }
         }
     }
     $CollectedShortcutEntries = New-Object System.Collections.ArrayList
@@ -857,41 +914,201 @@ function Resolve-ExecutableIdentity {
     return $null
 }
 
-# Matches installed applications by name or AUMID across all known sources. A pattern
-# without wildcards is treated as a substring, and the sources are consulted by priority
+# Matches installed applications across all known sources, consulted by priority
 # (shell:AppsFolder, then Start Menu, then Quick Launch), stopping at the first source
-# producing matches. An explicit wildcard pattern searches every source and returns all
-# matches, deduplicated by AUMID and by target path so an application present both as an
-# AppsFolder entry and as a Start Menu shortcut is only returned once. Each result carries
-# a Kind of 'Aumid' (pin through the UWP pipeline) or 'Lnk' (pin the shortcut file itself,
+# producing matches. An explicit wildcard pattern searches every source by display name
+# AND by AUMID and returns all matches (mass pin/unpin), deduplicated by AUMID and by
+# target path so an application present both as an AppsFolder entry and as a Start Menu
+# shortcut is only returned once. A bare name matches display names ONLY -- an AUMID often
+# embeds its Start Menu group folder name, which would drag unrelated siblings (an
+# 'Uninstall' entry of the same suite) into the match set -- and always resolves to a
+# single application : an exact display-name match wins outright, several matches are
+# narrowed down to exactly one by Select-SingleApplicationMatch. Each result carries a
+# Kind of 'Aumid' (pin through the UWP pipeline) or 'Lnk' (pin the shortcut file itself,
 # whose own AUMID is honoured by the .lnk pipeline downstream).
 function Find-ApplicationMatches {
     param([string]$NameOrAumidPattern)
-    $PatternHasWildcard    = $NameOrAumidPattern -match '[*?]'
-    $EffectiveMatchPattern = if ($PatternHasWildcard) { $NameOrAumidPattern } else { "*$NameOrAumidPattern*" }
-    $MatchedApplications   = @()
-    $AlreadyMatchedAumids  = @{}
-    $AlreadyMatchedTargets = @{}
-    foreach ($ApplicationEntry in (Get-AppsFolderSnapshot)) {
-        if ($ApplicationEntry.DisplayName -like $EffectiveMatchPattern -or $ApplicationEntry.Aumid -like $EffectiveMatchPattern) {
-            $MatchedApplications += @{ Kind = 'Aumid'; Aumid = $ApplicationEntry.Aumid; DisplayName = $ApplicationEntry.DisplayName }
-            $AlreadyMatchedAumids[$ApplicationEntry.Aumid] = $true
-            if ($ApplicationEntry.TargetParsingPath) { $AlreadyMatchedTargets[$ApplicationEntry.TargetParsingPath.ToLower()] = $true }
+    if ($NameOrAumidPattern -match '[*?]') {
+        # Invalid wildcard syntax (a stray '[') throws at the first -like : degrade the
+        # input to a literal pattern instead of crashing outside the exit-code contract.
+        try { $null = ('' -like $NameOrAumidPattern) } catch { $NameOrAumidPattern = [System.Management.Automation.WildcardPattern]::Escape($NameOrAumidPattern) }
+        $MatchedApplications   = @()
+        $AlreadyMatchedAumids  = @{}
+        $AlreadyMatchedTargets = @{}
+        foreach ($ApplicationEntry in (Get-AppsFolderSnapshot)) {
+            if ($ApplicationEntry.DisplayName -like $NameOrAumidPattern -or $ApplicationEntry.Aumid -like $NameOrAumidPattern) {
+                $MatchedApplications += @{ Kind = 'Aumid'; Aumid = $ApplicationEntry.Aumid; DisplayName = $ApplicationEntry.DisplayName }
+                $AlreadyMatchedAumids[$ApplicationEntry.Aumid] = $true
+                if ($ApplicationEntry.TargetParsingPath) { $AlreadyMatchedTargets[$ApplicationEntry.TargetParsingPath.ToLower()] = $true }
+            }
         }
-    }
-    if (-not $PatternHasWildcard -and $MatchedApplications.Count -gt 0) { return $MatchedApplications }
-    foreach ($CatalogRank in 1, 2) {
         foreach ($ShortcutEntry in (Get-ShortcutCatalog)) {
-            if ($ShortcutEntry.Rank -ne $CatalogRank -or $ShortcutEntry.DisplayName -notlike $EffectiveMatchPattern) { continue }
+            if ($ShortcutEntry.DisplayName -notlike $NameOrAumidPattern) { continue }
             if ($ShortcutEntry.TargetPath -and $AlreadyMatchedTargets.ContainsKey($ShortcutEntry.TargetPath.ToLower())) { continue }
             if ($ShortcutEntry.Aumid -and $AlreadyMatchedAumids.ContainsKey($ShortcutEntry.Aumid)) { continue }
             $MatchedApplications += @{ Kind = 'Lnk'; LnkPath = $ShortcutEntry.LnkPath; DisplayName = $ShortcutEntry.DisplayName }
             if ($ShortcutEntry.Aumid) { $AlreadyMatchedAumids[$ShortcutEntry.Aumid] = $true }
             if ($ShortcutEntry.TargetPath) { $AlreadyMatchedTargets[$ShortcutEntry.TargetPath.ToLower()] = $true }
         }
-        if (-not $PatternHasWildcard -and $MatchedApplications.Count -gt 0) { return $MatchedApplications }
+        return $MatchedApplications
     }
-    return $MatchedApplications
+    # Bare name : one pass per source collects the display-name substring matches while
+    # sorting out the exact matches, so exact resolution costs no extra scan. The name is
+    # escaped because [ ] form a wildcard character class under -like : a literal bracket
+    # would otherwise crash the run (unbalanced) or select a wrong application (balanced).
+    $SubstringMatchPattern = '*' + [System.Management.Automation.WildcardPattern]::Escape($NameOrAumidPattern) + '*'
+    $ExactNameMatches      = @()
+    $SubstringNameMatches  = @()
+    foreach ($ApplicationEntry in (Get-AppsFolderSnapshot)) {
+        if ($ApplicationEntry.DisplayName -notlike $SubstringMatchPattern) { continue }
+        $CandidateMatch = @{ Kind = 'Aumid'; Aumid = $ApplicationEntry.Aumid; DisplayName = $ApplicationEntry.DisplayName; CandidateTargetPath = [string]$ApplicationEntry.TargetParsingPath; CandidateIconPath = '' }
+        if ([string]::Equals($ApplicationEntry.DisplayName, $NameOrAumidPattern, [StringComparison]::OrdinalIgnoreCase)) { $ExactNameMatches += $CandidateMatch } else { $SubstringNameMatches += $CandidateMatch }
+    }
+    # Direct assignment (no if-expression) : assigning a one-element array out of an
+    # if-expression unwraps it to the bare hashtable, whose .Count counts its keys.
+    $CandidateSet = $SubstringNameMatches
+    if ($ExactNameMatches.Count -gt 0) { $CandidateSet = $ExactNameMatches }
+    if ($CandidateSet.Count -eq 1) { return $CandidateSet }
+    if ($CandidateSet.Count -gt 1) { return @(Select-SingleApplicationMatch $CandidateSet $NameOrAumidPattern) }
+    foreach ($CatalogRank in 1, 2) {
+        $ExactNameMatches     = @()
+        $SubstringNameMatches = @()
+        foreach ($ShortcutEntry in (Get-ShortcutCatalog)) {
+            if ($ShortcutEntry.Rank -ne $CatalogRank -or $ShortcutEntry.DisplayName -notlike $SubstringMatchPattern) { continue }
+            $CandidateMatch = @{ Kind = 'Lnk'; LnkPath = $ShortcutEntry.LnkPath; DisplayName = $ShortcutEntry.DisplayName; Aumid = [string]$ShortcutEntry.Aumid; CandidateTargetPath = [string]$ShortcutEntry.TargetPath; CandidateIconPath = [string]$ShortcutEntry.IconPath }
+            if ([string]::Equals($ShortcutEntry.DisplayName, $NameOrAumidPattern, [StringComparison]::OrdinalIgnoreCase)) { $ExactNameMatches += $CandidateMatch } else { $SubstringNameMatches += $CandidateMatch }
+        }
+        $CandidateSet = $SubstringNameMatches
+        if ($ExactNameMatches.Count -gt 0) { $CandidateSet = $ExactNameMatches }
+        if ($CandidateSet.Count -eq 1) { return $CandidateSet }
+        if ($CandidateSet.Count -gt 1) { return @(Select-SingleApplicationMatch $CandidateSet $NameOrAumidPattern) }
+    }
+    return @()
+}
+
+# Keeps the candidates whose EliminationMetric equals the smallest value of the set.
+function Select-MinimumMetricCandidates {
+    param($ScoredCandidates)
+    $SmallestMetricValue = $ScoredCandidates[0].EliminationMetric
+    for ($CandidateIndex = 1; $CandidateIndex -lt $ScoredCandidates.Count; $CandidateIndex++) {
+        if ($ScoredCandidates[$CandidateIndex].EliminationMetric -lt $SmallestMetricValue) { $SmallestMetricValue = $ScoredCandidates[$CandidateIndex].EliminationMetric }
+    }
+    $CandidatesAtMinimum = @()
+    foreach ($ScoredCandidate in $ScoredCandidates) {
+        if ($ScoredCandidate.EliminationMetric -eq $SmallestMetricValue) { $CandidatesAtMinimum += $ScoredCandidate }
+    }
+    return $CandidatesAtMinimum
+}
+
+# Determines whether a candidate displays an icon of its own. UWP applications always do
+# (the package manifest requires a logo asset), and candidates whose TARGET lives under
+# the Windows directory are exempt from the judgement altogether (system tools are not
+# penalized for how they carry their icon). Other filesystem candidates resolve their
+# icon source the way the shell does -- the shortcut IconLocation when set, the target
+# otherwise : a UNC source is accepted unprobed (a dead share would stall the run for the
+# SMB timeout); an ADS-embedded icon or a standalone .ico file is an explicit asset; a
+# source borrowed from the Windows directory is a generic system icon; a PE source owns
+# its icon only when it embeds icon resources (none, and the shell synthesizes a generic
+# rendering for it, typical of 'Uninstall'/'Reinstall' suite utilities). The Windows
+# directory prefix is boundary-checked so C:\Windows.old or C:\Windows Kits do not match.
+function Test-CandidateOwnsIcon {
+    param($Candidate)
+    if ($Candidate.IsUwpApplication) { return $true }
+    $WindowsDirectoryPrefix = $env:SystemRoot
+    if (-not $WindowsDirectoryPrefix.EndsWith('\')) { $WindowsDirectoryPrefix = $WindowsDirectoryPrefix + '\' }
+    $CandidateTargetPath = $Candidate.CandidateTargetPath
+    if ($CandidateTargetPath -and $CandidateTargetPath.StartsWith($WindowsDirectoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $IconSourcePath = $Candidate.CandidateIconPath
+    if (-not $IconSourcePath) { $IconSourcePath = $CandidateTargetPath }
+    if (-not $IconSourcePath) { return $false }
+    if ($IconSourcePath.StartsWith('\\')) { return $true }
+    if ($IconSourcePath.EndsWith(':icon.ico', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if ($IconSourcePath.StartsWith($WindowsDirectoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ($IconSourcePath.EndsWith('.ico', [StringComparison]::OrdinalIgnoreCase)) { return [IO.File]::Exists($IconSourcePath) }
+    return ([TaskbarPin]::GetIconResourceCount($IconSourcePath) -gt 0)
+}
+
+# Reduces several bare-name matches to exactly one application through successive
+# elimination stages, each applied only when at least one candidate survives it :
+#   1. drop candidates that are neither UWP applications nor .exe-backed
+#   2. drop candidates without an icon of their own (their displayed icon is synthesized)
+#   3. keep the shortest display name
+#   4. keep the shallowest target path -- a single candidate without a measurable target
+#      (UWP application, registered-AUMID entry) among measurable ones wins instead
+#   5. keep the earliest position of the typed name inside the display name
+#   6. keep the first display name in ordinal order (deterministic last resort)
+# Expensive probes (icon resource counting) only ever run on the survivors of the
+# preceding stages, and every stage is skipped once a single candidate remains.
+function Select-SingleApplicationMatch {
+    param($CandidateMatches, [string]$BareNameInput)
+    Initialize-NativeHelper
+    $RemainingCandidates = @($CandidateMatches)
+    Write-Log "  [select] '$BareNameInput' matched $($RemainingCandidates.Count) applications -- reducing to a single one"
+    foreach ($Candidate in $RemainingCandidates) {
+        # UWP is recognized by the AUMID shape alone (PackageFamily!AppId : a '!' and no
+        # path separator), whatever the source : a Start Menu .lnk carrying a packaged
+        # AUMID is as much a UWP application as its AppsFolder entry.
+        $CandidateAumid = [string]$Candidate.Aumid
+        $Candidate.IsUwpApplication = ($CandidateAumid.IndexOf('!') -ge 0 -and $CandidateAumid.IndexOf('\') -lt 0)
+    }
+    if ($RemainingCandidates.Count -gt 1) {
+        $ExecutableBackedCandidates = @()
+        foreach ($Candidate in $RemainingCandidates) {
+            if ($Candidate.IsUwpApplication -or $Candidate.CandidateTargetPath.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $ExecutableBackedCandidates += $Candidate }
+        }
+        if ($ExecutableBackedCandidates.Count -gt 0 -and $ExecutableBackedCandidates.Count -lt $RemainingCandidates.Count) {
+            Write-Log "  [select] executable/UWP filter : $($RemainingCandidates.Count) -> $($ExecutableBackedCandidates.Count)"
+            $RemainingCandidates = $ExecutableBackedCandidates
+        }
+    }
+    if ($RemainingCandidates.Count -gt 1) {
+        $OwnIconCandidates = @()
+        foreach ($Candidate in $RemainingCandidates) {
+            if (Test-CandidateOwnsIcon $Candidate) { $OwnIconCandidates += $Candidate }
+        }
+        if ($OwnIconCandidates.Count -gt 0 -and $OwnIconCandidates.Count -lt $RemainingCandidates.Count) {
+            Write-Log "  [select] own-icon filter : $($RemainingCandidates.Count) -> $($OwnIconCandidates.Count)"
+            $RemainingCandidates = $OwnIconCandidates
+        }
+    }
+    if ($RemainingCandidates.Count -gt 1) {
+        foreach ($Candidate in $RemainingCandidates) { $Candidate.EliminationMetric = $Candidate.DisplayName.Length }
+        $RemainingCandidates = @(Select-MinimumMetricCandidates $RemainingCandidates)
+    }
+    if ($RemainingCandidates.Count -gt 1) {
+        # Depth is measured on the filesystem target only. Candidates without one (UWP
+        # applications, registered-AUMID entries) cannot be compared : a single
+        # unmeasurable candidate among measurable ones wins (its depth cannot disqualify
+        # it), several unmeasurable candidates make the stage inapplicable.
+        $MeasurableCandidates   = @()
+        $UnmeasurableCandidates = @()
+        foreach ($Candidate in $RemainingCandidates) {
+            if ($Candidate.CandidateTargetPath) { $MeasurableCandidates += $Candidate } else { $UnmeasurableCandidates += $Candidate }
+        }
+        if ($UnmeasurableCandidates.Count -eq 0) {
+            foreach ($Candidate in $RemainingCandidates) { $Candidate.EliminationMetric = $Candidate.CandidateTargetPath.Split('\').Length }
+            $RemainingCandidates = @(Select-MinimumMetricCandidates $RemainingCandidates)
+        } elseif ($UnmeasurableCandidates.Count -eq 1 -and $MeasurableCandidates.Count -gt 0) {
+            $RemainingCandidates = $UnmeasurableCandidates
+        }
+    }
+    if ($RemainingCandidates.Count -gt 1) {
+        # -like folds some characters case-invariantly that an ordinal IndexOf does not
+        # (Turkish dotted I...), so a match can still yield -1 here : clamp it to the
+        # worst rank instead of letting -1 beat every real position.
+        foreach ($Candidate in $RemainingCandidates) {
+            $PatternPositionInTitle = $Candidate.DisplayName.IndexOf($BareNameInput, [StringComparison]::OrdinalIgnoreCase)
+            if ($PatternPositionInTitle -lt 0) { $PatternPositionInTitle = [int]::MaxValue }
+            $Candidate.EliminationMetric = $PatternPositionInTitle
+        }
+        $RemainingCandidates = @(Select-MinimumMetricCandidates $RemainingCandidates)
+    }
+    $SelectedApplicationMatch = $RemainingCandidates[0]
+    for ($CandidateIndex = 1; $CandidateIndex -lt $RemainingCandidates.Count; $CandidateIndex++) {
+        if ([string]::CompareOrdinal($RemainingCandidates[$CandidateIndex].DisplayName, $SelectedApplicationMatch.DisplayName) -lt 0) { $SelectedApplicationMatch = $RemainingCandidates[$CandidateIndex] }
+    }
+    Write-Log "  [select] selected : '$($SelectedApplicationMatch.DisplayName)'"
+    return $SelectedApplicationMatch
 }
 
 # Produces a .lnk suitable for taskbar pinning from a resolved filesystem path, and reports
@@ -943,18 +1160,20 @@ function New-TargetShortcut {
     $TemporaryLnkPath = [IO.Path]::Combine($env:TEMP, "$ShortcutDisplayName.lnk")
     if (-not $WshShellComObjectRef.Value) { $WshShellComObjectRef.Value = New-Object -ComObject WScript.Shell }
     $NewShortcutObject = $WshShellComObjectRef.Value.CreateShortcut($TemporaryLnkPath)
-    if ($TargetFileExtension -eq '.cpl') {
+    if ([IO.Directory]::Exists($ResolvedTargetPath)) {
+        # Checked before the .cpl extension : a directory whose name ends in .cpl is a
+        # directory, and a rundll32 Control_RunDLL shortcut would be broken for it.
+        $NewShortcutObject.TargetPath       = [IO.Path]::Combine($env:SystemRoot, 'explorer.exe')
+        $NewShortcutObject.Arguments        = "`"$ResolvedTargetPath`""
+        $NewShortcutObject.IconLocation     = [IO.Path]::Combine($env:SystemRoot, 'System32\shell32.dll') + ',3'
+        $NewShortcutObject.WorkingDirectory = $ResolvedTargetPath
+    } elseif ($TargetFileExtension -eq '.cpl') {
         # The BEEF001D content is the .cpl argument rather than rundll32.exe : the host
         # executable is shared by many items and the parsing name must stay unique per pin.
         $NewShortcutObject.TargetPath       = [IO.Path]::Combine($env:SystemRoot, 'System32\rundll32.exe')
         $NewShortcutObject.Arguments        = "shell32.dll,Control_RunDLL `"$ResolvedTargetPath`""
         $NewShortcutObject.IconLocation     = "$ResolvedTargetPath,0"
         $NewShortcutObject.WorkingDirectory = [IO.Path]::GetDirectoryName($ResolvedTargetPath)
-    } elseif ([IO.Directory]::Exists($ResolvedTargetPath)) {
-        $NewShortcutObject.TargetPath       = [IO.Path]::Combine($env:SystemRoot, 'explorer.exe')
-        $NewShortcutObject.Arguments        = "`"$ResolvedTargetPath`""
-        $NewShortcutObject.IconLocation     = [IO.Path]::Combine($env:SystemRoot, 'System32\shell32.dll') + ',3'
-        $NewShortcutObject.WorkingDirectory = $ResolvedTargetPath
     } else {
         $NewShortcutObject.TargetPath       = $ResolvedTargetPath
         $NewShortcutObject.WorkingDirectory = [IO.Path]::GetDirectoryName($ResolvedTargetPath)
@@ -1164,8 +1383,9 @@ if ($Unpin) {
                     if ($CplMatch) { $CplResolvedPattern = $CplMatch.Name -replace '[<>:"/\\|?*]', '_'; break }
                 }
             }
-            if ($CplResolvedPattern) { $UnpinMatchPatterns += $CplResolvedPattern; Write-Log "  [pattern] CPL '$InputItem' resolved to display name pattern '$CplResolvedPattern'" }
-            else { $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem); Write-Log "  [pattern] CPL '$InputItem' could not be resolved via namespace -- using its base name" 'Yellow' }
+            # Literal names are escaped before use as -like patterns ([ ] would misfire).
+            if ($CplResolvedPattern) { $UnpinMatchPatterns += [System.Management.Automation.WildcardPattern]::Escape($CplResolvedPattern); Write-Log "  [pattern] CPL '$InputItem' resolved to display name pattern '$CplResolvedPattern'" }
+            else { $UnpinMatchPatterns += [System.Management.Automation.WildcardPattern]::Escape([IO.Path]::GetFileNameWithoutExtension($InputItem)); Write-Log "  [pattern] CPL '$InputItem' could not be resolved via namespace -- using its base name" 'Yellow' }
         } else {
             # Baseline pattern : same behavior as before so explicit and wildcard patterns keep working.
             if (($InputItem -match '[/\\]' -and -not $InputHasWildcard) -or $InputExtension -eq '.msc' -or $InputExtension -eq '.exe') { $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($InputItem) }
@@ -1178,26 +1398,31 @@ if ($Unpin) {
             $ResolvedUnpinPaths = @(Resolve-FilesystemInput $InputItem)
             if ($ResolvedUnpinPaths.Count -gt 0) {
                 foreach ($ResolvedUnpinPath in $ResolvedUnpinPaths) {
-                    $UnpinMatchPatterns += [IO.Path]::GetFileNameWithoutExtension($ResolvedUnpinPath)
+                    $UnpinMatchPatterns += [System.Management.Automation.WildcardPattern]::Escape([IO.Path]::GetFileNameWithoutExtension($ResolvedUnpinPath))
                     if ([IO.Path]::GetExtension($ResolvedUnpinPath).ToLower() -eq '.exe') {
                         $UnpinExecutableIdentity = Resolve-ExecutableIdentity $ResolvedUnpinPath
                         if ($UnpinExecutableIdentity) {
-                            $UnpinMatchPatterns += ($UnpinExecutableIdentity.DisplayName -replace '[<>:"/\\|?*]', '_')
-                            $UnpinMatchPatterns += $UnpinExecutableIdentity.Aumid
+                            $UnpinMatchPatterns += [System.Management.Automation.WildcardPattern]::Escape(($UnpinExecutableIdentity.DisplayName -replace '[<>:"/\\|?*]', '_'))
+                            $UnpinMatchPatterns += [System.Management.Automation.WildcardPattern]::Escape($UnpinExecutableIdentity.Aumid)
                             Write-Log "  [pattern] '$InputItem' carries application identity '$($UnpinExecutableIdentity.DisplayName)' ($($UnpinExecutableIdentity.Aumid))"
                         }
                     }
                 }
             } elseif ($InputItem -notmatch '[/\\]') {
                 foreach ($UnpinApplicationMatch in @(Find-ApplicationMatches $InputItem)) {
-                    $UnpinMatchPatterns += ($UnpinApplicationMatch.DisplayName -replace '[<>:"/\\|?*]', '_')
-                    if ($UnpinApplicationMatch.Kind -eq 'Aumid') { $UnpinMatchPatterns += $UnpinApplicationMatch.Aumid }
+                    $UnpinMatchPatterns += [System.Management.Automation.WildcardPattern]::Escape(($UnpinApplicationMatch.DisplayName -replace '[<>:"/\\|?*]', '_'))
+                    if ($UnpinApplicationMatch.Kind -eq 'Aumid') { $UnpinMatchPatterns += [System.Management.Automation.WildcardPattern]::Escape($UnpinApplicationMatch.Aumid) }
                     Write-Log "  [pattern] '$InputItem' matched installed application '$($UnpinApplicationMatch.DisplayName)'"
                 }
             }
         }
     }
     $UnpinMatchPatterns = @($UnpinMatchPatterns | Where-Object { $_ } | Select-Object -Unique)
+    # Raw input kept as a pattern may carry invalid wildcard syntax (a stray '[') that
+    # would throw at the first -like : degrade those to literal patterns.
+    $UnpinMatchPatterns = @(foreach ($UnpinPattern in $UnpinMatchPatterns) {
+        try { $null = ('' -like $UnpinPattern); $UnpinPattern } catch { [System.Management.Automation.WildcardPattern]::Escape($UnpinPattern) }
+    })
     $DisplayPatternLabel = $UnpinMatchPatterns -join ', '
     Write-Banner 'UNPIN' 'DarkRed' "$DisplayPatternLabel$(if ($AllUsers) { ' (AllUsers)' })"
     Write-OperationLogHeader 'UNPIN' "patterns : $DisplayPatternLabel"
@@ -1304,6 +1529,8 @@ if ($UwpInputItems.Count -gt 0) {
     foreach ($PatternUwpInput in $PatternUwpInputs) {
         $UwpMatchPattern = $PatternUwpInput.Substring(17)
         if (-not $UwpMatchPattern) { continue }
+        # Invalid wildcard syntax degrades to a literal pattern instead of crashing.
+        try { $null = ('' -like $UwpMatchPattern) } catch { $UwpMatchPattern = [System.Management.Automation.WildcardPattern]::Escape($UwpMatchPattern) }
         $MatchedAnyApplication = $false
         foreach ($ApplicationEntry in (Get-AppsFolderSnapshot)) {
             if (($ApplicationEntry.DisplayName -like $UwpMatchPattern -or $ApplicationEntry.Aumid -like $UwpMatchPattern) -and -not $AlreadyResolvedApplicationAumids.ContainsKey($ApplicationEntry.Aumid)) {
@@ -1403,7 +1630,8 @@ if ($DirectBlobWriteIsSupported) {
             $PinTargetDisplayName = $PinTarget.DisplayName
             $Beef001dParsingName  = $PinTarget.Aumid
             $DestinationLnkPath   = [IO.Path]::Combine($TaskBarPinnedDirectory, "$($PinTarget.DisplayName -replace '[<>:"/\\|?*]', '_').lnk")
-            if (-not [IO.File]::Exists($DestinationLnkPath)) {
+            $DestinationLnkAlreadyPinned = [IO.File]::Exists($DestinationLnkPath)
+            if (-not $DestinationLnkAlreadyPinned) {
                 Write-Log "  [uwp] Creating shortcut '$([IO.Path]::GetFileName($DestinationLnkPath))' for AUMID '$($PinTarget.Aumid)'..."
                 if (-not [TaskbarPin]::CreateAppShortcut($PinTarget.Aumid, $DestinationLnkPath)) {
                     Write-Log "  [uwp] CreateAppShortcut FAILED for '$($PinTarget.Aumid)' -- deferring to Quick Launch" 'Yellow'
@@ -1421,8 +1649,9 @@ if ($DirectBlobWriteIsSupported) {
             $ShortcutIsTemporary  = ($SourceShortcutPath -ne $PinTarget.ResolvedPath)
             $PinTargetDisplayName = [IO.Path]::GetFileName($SourceShortcutPath)
             $DestinationLnkPath   = [IO.Path]::Combine($TaskBarPinnedDirectory, $PinTargetDisplayName)
+            $DestinationLnkAlreadyPinned = [IO.File]::Exists($DestinationLnkPath)
             Write-Log "  [fs] Target : '$($PinTarget.ResolvedPath)' | shortcut : '$PinTargetDisplayName' | BEEF001D : '$Beef001dParsingName'"
-            if (-not [IO.File]::Exists($DestinationLnkPath)) { [IO.File]::Copy($SourceShortcutPath, $DestinationLnkPath) }
+            if (-not $DestinationLnkAlreadyPinned) { [IO.File]::Copy($SourceShortcutPath, $DestinationLnkPath) }
         }
         # Build the binary blob entry. The .lnk lives under the profile so SHParseDisplayName
         # yields a namespace PIDL; cross-user mode uses filesystem PIDLs instead because
@@ -1437,7 +1666,8 @@ if ($DirectBlobWriteIsSupported) {
             Write-Log "  [blob] Entry ready for '$PinTargetDisplayName' : $($SerializedBlobEntry.Length) bytes"
         } else {
             Write-Log "  [blob] Blob entry could not be built for '$PinTargetDisplayName' (SHParseDisplayName failed) -- deferring to Quick Launch" 'Yellow'
-            if ($DestinationLnkPath -and [IO.File]::Exists($DestinationLnkPath)) { try { [IO.File]::Delete($DestinationLnkPath) } catch { } }
+            # Only clean up a .lnk created by this run : never delete a pre-existing live pin.
+            if ($DestinationLnkPath -and -not $DestinationLnkAlreadyPinned -and [IO.File]::Exists($DestinationLnkPath)) { try { [IO.File]::Delete($DestinationLnkPath) } catch { } }
             $ItemsDeferredToQuickLaunch += $PinTarget
         }
     }
