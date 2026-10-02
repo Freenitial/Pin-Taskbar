@@ -16,12 +16,17 @@ Every other taskbar pin tool either:
 
 This tool writes directly to the taskbar's internal data structures with proper synchronization, producing results indistinguishable from a native pin operation. No restart, no flicker, instant.
 
+Starting with v1.6, the behavior is now identical to Windows (99% certain).
+Even better: you can pin **anything**, including what Explorer itself refuses to pin (any file, folder, Control Panel applet `.cpl`, console `.msc`, etc.).
+If you have used a previous version, it is recommended that you run `Pin-Taskbar.ps1 -Repair`.
+
 
 ## Features
 
 - **Pin** any file, application or folder to the taskbar
 - **Unpin** supported
-- **AllUsers** mode - propagate pins across all user profiles (requires elevation)
+- **Repair** - checks every pinned item and repairs the malformed ones
+- **AllUsers** mode - propagate pins across all user profiles and the Default profile (requires elevation, works from the SYSTEM account)
 - Multiple input (Semicolon-delimited) / wildcard supported
 - UWP apps via AUMID, `shell:AppsFolder\`, or `uwp:` prefix
 - Special support for `.msc` and `.cpl` files (proper icon display)
@@ -31,7 +36,7 @@ This tool writes directly to the taskbar's internal data structures with proper 
 
 | File | Format | Use case |
 |---|---|---|
-| `Pin-Taskbar.ps1` | Standalone PowerShell script | Command-line / deployment / GPO logon scripts. Supports `-LogFile` and returns exit codes. |
+| `Pin-Taskbar.ps1` | Standalone PowerShell script | Command-line / deployment / GPO logon scripts. Supports `-Repair`, `-LogFile` and returns exit codes. |
 | `Pin-Taskbar.bat` | Standalone Batch/PowerShell hybrid | Same as above, but bypasses PowerShell execution policy restrictions. |
 | `Set-TaskbarPin.ps1` | PowerShell function | Compact. Import into modules, call/integrate in other scripts. |
 
@@ -81,12 +86,26 @@ This tool writes directly to the taskbar's internal data structures with proper 
 .\Pin-Taskbar.ps1 -Unpin * -AllUsers
 ```
 
+### Repair
+
+```powershell
+# Check every pinned item and repair the malformed ones
+.\Pin-Taskbar.ps1 -Repair
+
+# Repair for all users (requires admin)
+.\Pin-Taskbar.ps1 -Repair -AllUsers
+
+# Repair, then pin
+.\Pin-Taskbar.ps1 "notepad" -Repair
+```
+
 ### Via the .bat hybrid
 
 ```batch
 Pin-Taskbar.bat "notepad"
 Pin-Taskbar.bat "C:\App1.lnk;C:\App2.exe" -AllUsers
 Pin-Taskbar.bat -Unpin "Notepad*"
+Pin-Taskbar.bat -Repair
 Pin-Taskbar.bat -help
 ```
 
@@ -100,21 +119,22 @@ Set-TaskbarPin "C:\Windows\System32\main.cpl" -Silent
 
 ## Parameters
 
-| Parameter | Description |
-|---|---|
-| `-Pin` | Path(s) to pin. Supports `.lnk`, `.exe`, `.msc`, `.cpl`, UWP AUMIDs, directories. Semicolon-delimited. |
-| `-Unpin` | Switch. Turns `-Pin` into a match pattern for removal. |
-| `-Silent` | Suppresses console output. |
-| `-LogFile` | Path to a `.txt` or `.log` file for detailed logging. Standalone scripts only. |
-| `-AllUsers` | Applies operation to all user profiles. Requires elevation. |
+| Parameter | Aliases | Description |
+|---|---|---|
+| `-Pin` | `-Path`, `-File`, `-Files` | First positional argument. Path(s) to pin: `.lnk`, `.exe`, `.msc`, `.cpl`, directories, application names, UWP AUMIDs. Semicolon-delimited (`;;` for a semicolon inside an item), wildcards supported. A bare name pins one application (exact display name first); a wildcard pins every match. |
+| `-Unpin` | `-Remove` | Switch. Turns `-Pin` into a match pattern for removal. |
+| `-Repair` | `-Fix` | Switch. Checks every pinned item and repairs the malformed ones (extension blocks, AppID, resolve records, entries whose shortcut is gone or listed twice). Can be combined with `-Pin` or `-Unpin`. Standalone scripts only. |
+| `-Silent` | `-S` | Suppresses console output. The log file is not affected. |
+| `-LogFile` | `-Log` | Path to a `.txt` or `.log` file for detailed logging. Standalone scripts only. |
+| `-AllUsers` | `-Everyone`, `-All` | Applies the operation to every user profile and to the Default profile (users created later). Requires elevation; also works from the SYSTEM account (deployment tools, startup scripts). |
 
 ## Exit codes (standalone script and .bat only)
 
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `2` | Nothing found to pin/unpin |
-| `3` | Operation failed |
+| `2` | Nothing found to pin/unpin/repair |
+| `3` | Failure: an error, or an item that could not be pinned or unpinned |
 
 ## Requirements
 
