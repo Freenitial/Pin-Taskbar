@@ -32,13 +32,13 @@ If you have used a previous version, it is recommended that you run `Pin-Taskbar
 - Special support for `.msc` and `.cpl` files (proper icon display)
 - PowerShell 2.0+ compatible
 
-## Three ways
+## Which file to use
 
-| File | Format | Use case |
-|---|---|---|
-| `Pin-Taskbar.ps1` | Standalone PowerShell script | Command-line / deployment / GPO logon scripts. Supports `-Repair`, `-LogFile` and returns exit codes. |
-| `Pin-Taskbar.bat` | Standalone Batch/PowerShell hybrid | Same as above, but bypasses PowerShell execution policy restrictions. |
-| `Set-TaskbarPin.ps1` | PowerShell function | Compact. Import into modules, call/integrate in other scripts. |
+| File | Kind | Best for | What it offers |
+|---|---|---|---|
+| `Pin-Taskbar.ps1` | Standalone script | Command line, deployment tools, GPO logon scripts | Everything: pin, unpin, `-AllUsers`, `-Repair`, `-LogFile`, exit codes, `Get-Help` |
+| `Pin-Taskbar.bat` | Standalone script (Batch/PowerShell hybrid) | Same, where the execution policy blocks `.ps1` files | Same as `Pin-Taskbar.ps1`; run it from `cmd`, a double-click or any tool that runs batch files |
+| `Set-TaskbarPin.ps1` | PowerShell function | Your own scripts and modules: dot-source it (`. .\Set-TaskbarPin.ps1`) or paste it into your console or script, then call `Set-TaskbarPin` | Pin, unpin, `-AllUsers`, `-Silent`. No `-Repair` (the items it pins are still repaired), no `-LogFile`, no exit codes |
 
 ## Usage
 
