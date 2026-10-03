@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Pin or unpin shortcuts from the Windows taskbar programmatically.
-    Version 1.6
+    Version 1.7
 .DESCRIPTION
     Pins or unpins items to/from the Windows taskbar across all Windows versions.
 
@@ -14,12 +14,16 @@
       - An item already pinned is updated in place (target, icon, name kept) and its entry
         repaired when malformed. A name already used by another application's pin gets
         ' (2)', ' (3)'..., as Windows does.
+      - A pinned shortcut Windows gives no AppID of its own (a document, a script, a folder,
+        a .cpl) carries the AppID its pin is listed under : the taskbar would otherwise drop
+        the pin when it reloads the shortcut.
 
     UNPIN strategy :
       - Removes matching entries from the Taskband registry blob, deletes the .lnk files,
         and notifies the taskbar. On Vista, deletes the matching Quick Launch shortcuts.
 
-    REPAIR : checks every pinned item and repairs the malformed ones, resolve records included.
+    REPAIR : checks every pinned item and repairs the malformed ones, resolve records included,
+    and the pins earlier versions left fragile or damaged.
 
     When -AllUsers is specified, the script loads each user's offline registry hive
     (NTUSER.DAT) and replicates the operation across all profiles, the Default profile
@@ -35,9 +39,10 @@
 .PARAMETER Unpin
     Triggers unpin mode. -Pin becomes a match pattern.
 .PARAMETER Repair
-    Checks every pinned item and repairs the malformed ones (extension blocks, AppID,
-    FavoritesResolve records, entries whose shortcut is gone or listed twice). Can be
-    combined with -Pin or -Unpin.
+    Checks every pinned item and repairs the malformed ones (extension blocks, AppID, the
+    AppID of a shortcut Windows gives none, FavoritesResolve records, entries whose shortcut
+    is gone or listed twice, a second entry of the same application). Can be combined with
+    -Pin or -Unpin.
 .PARAMETER Silent
     Suppresses all console output. Log file output is not affected.
 .PARAMETER LogFile
@@ -294,7 +299,7 @@ function Initialize-NativeHelper {
     $NativeHelperType = 'TaskbarPin' -as [Type]
     if ($NativeHelperType) {
         $HelperVersionField = $NativeHelperType.GetField('HelperVersion')
-        if (-not $HelperVersionField -or $HelperVersionField.GetValue($null) -ne '1.6') { throw 'This PowerShell session holds the helper of another Pin-Taskbar version : run the script in a new PowerShell session.' }
+        if (-not $HelperVersionField -or $HelperVersionField.GetValue($null) -ne '1.7') { throw 'This PowerShell session holds the helper of another Pin-Taskbar version : run the script in a new PowerShell session.' }
         return
     }
     Write-Log "[init] Compiling C# native helper..."
@@ -305,7 +310,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 
 public class TaskbarPin {
-    public const string HelperVersion = "1.6";
+    public const string HelperVersion = "1.7";
 
     // Win32 imports : PIDLs, shell parsing, taskbar window lookup, COM, mutex, files.
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern IntPtr ILCreateFromPathW(string pszPath);
@@ -447,15 +452,17 @@ public class TaskbarPin {
         } finally { Release(pps); }
     }
 
-    // Loads (IPersistFile::Load, read-only) or saves (IPersistFile::Save) an IShellLink file.
-    static bool PersistLoad(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, false); }
-    static bool PersistSave(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, true); }
-    static bool PersistFile(IntPtr psl, IntPtr vtLink, string lnkPath, bool save) {
+    // Loads (IPersistFile::Load, read-only, or read-write for a property change : a link loaded
+    // read-only refuses it) or saves (IPersistFile::Save) an IShellLink file.
+    static bool PersistLoad(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, false, 0); }
+    static bool PersistLoadWritable(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, false, 2); }
+    static bool PersistSave(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, true, 0); }
+    static bool PersistFile(IntPtr psl, IntPtr vtLink, string lnkPath, bool save, uint loadMode) {
         Guid iid = IID_IPersistFile; IntPtr ppf;
         if (Vtbl<FnQueryInterface>(vtLink, 0)(psl, ref iid, out ppf) != 0) return false;
         try {
             IntPtr pathPtr = Marshal.StringToCoTaskMemUni(lnkPath);
-            try { return (save ? Slot<FnSaveFile>(ppf, 6)(ppf, pathPtr, 1) : Slot<FnLoadFile>(ppf, 5)(ppf, pathPtr, 0)) == 0; }
+            try { return (save ? Slot<FnSaveFile>(ppf, 6)(ppf, pathPtr, 1) : Slot<FnLoadFile>(ppf, 5)(ppf, pathPtr, loadMode)) == 0; }
             finally { Marshal.FreeCoTaskMem(pathPtr); }
         } finally { Release(ppf); }
     }
@@ -1007,12 +1014,44 @@ public class TaskbarPin {
             } finally { Release(psl, vtLink); }
         });
     }
+    // Writes PKEY_AppUserModel_ID into an existing .lnk (false when any step fails). The link is
+    // saved to a temporary file, whose content then replaces the shortcut's in place : a save
+    // over the shortcut would drop its alternate data streams, an embedded icon among them.
+    public static bool SetAumid(string lnkPath, string aumid) {
+        return RunOnSTA<bool>(delegate() {
+            string savedPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".lnk");
+            try {
+                Guid cls = CLSID_ShellLink; Guid iid = IID_IShellLinkW; IntPtr psl;
+                if (CoCreateInstance(ref cls, IntPtr.Zero, 1, ref iid, out psl) != 0) return false;
+                IntPtr vtLink = Marshal.ReadIntPtr(psl);
+                bool saved;
+                try { saved = PersistLoadWritable(psl, vtLink, lnkPath) && WriteAumidToStore(psl, vtLink, aumid) && PersistSave(psl, vtLink, savedPath); }
+                finally { Release(psl, vtLink); }
+                if (saved) WriteInPlace(lnkPath, System.IO.File.ReadAllBytes(savedPath));
+                return saved;
+            } finally { try { System.IO.File.Delete(savedPath); } catch { } }
+        });
+    }
+
+    // The system's ANSI code page, in which a .lnk stores its ANSI strings : Encoding.Default is
+    // UTF-8 on .NET (PowerShell 6 and later). Encoding.Default when the code page is unavailable.
+    [DllImport("kernel32.dll")] static extern uint GetACP();
+    static System.Text.Encoding ansiEncoding;
+    static System.Text.Encoding Ansi {
+        get {
+            if (ansiEncoding == null) {
+                try { ansiEncoding = System.Text.Encoding.GetEncoding((int)GetACP()); }
+                catch { ansiEncoding = System.Text.Encoding.Default; }
+            }
+            return ansiEncoding;
+        }
+    }
 
     // Reads a null-terminated ANSI string from a byte array.
     static string ReadAnsiZ(byte[] d, int pos) {
         int end = pos;
         while (end < d.Length && d[end] != 0) end++;
-        return System.Text.Encoding.Default.GetString(d, pos, end - pos);
+        return Ansi.GetString(d, pos, end - pos);
     }
 
     // Reads a null-terminated Unicode string from a byte array.
@@ -1086,11 +1125,11 @@ public class TaskbarPin {
             if (pos + 2 + byteCount > d.Length) return;
             if (stringDataFlags[i] == 0x08) {               // HasRelativePath
                 relativePath = isUnicode ? System.Text.Encoding.Unicode.GetString(d, pos + 2, byteCount)
-                                         : System.Text.Encoding.Default.GetString(d, pos + 2, byteCount);
+                                         : Ansi.GetString(d, pos + 2, byteCount);
             }
             else if (stringDataFlags[i] == 0x40) {          // HasIconLocation
                 iconPath = isUnicode ? System.Text.Encoding.Unicode.GetString(d, pos + 2, byteCount)
-                                     : System.Text.Encoding.Default.GetString(d, pos + 2, byteCount);
+                                     : Ansi.GetString(d, pos + 2, byteCount);
             }
             pos += 2 + byteCount;
         }
@@ -1629,12 +1668,9 @@ function New-TargetShortcut {
     $TargetFileExtension = [IO.Path]::GetExtension($ResolvedTargetPath).ToLower()
     if (-not $WshShellComObjectRef.Value) { $WshShellComObjectRef.Value = New-Object -ComObject WScript.Shell }
     if ($TargetFileExtension -eq '.lnk') {
-        $ShortcutObject = $WshShellComObjectRef.Value.CreateShortcut($ResolvedTargetPath)
-        $ShortcutTargetPath = $ShortcutObject.TargetPath
-        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShortcutObject)
         $ShortcutAppUserModelId = ''
         if ('TaskbarPin' -as [Type]) { $ShortcutAppUserModelId = [TaskbarPin]::GetAumid($ResolvedTargetPath) }
-        if ($ShortcutAppUserModelId) { $Beef001dContentRef.Value = $ShortcutAppUserModelId } else { $Beef001dContentRef.Value = $ShortcutTargetPath }
+        if ($ShortcutAppUserModelId) { $Beef001dContentRef.Value = $ShortcutAppUserModelId } else { $Beef001dContentRef.Value = Get-ShortcutFallbackAppId $ResolvedTargetPath }
         return $ResolvedTargetPath
     }
     if ($TargetFileExtension -eq '.cpl') {
@@ -1842,6 +1878,77 @@ function Find-PinnedApplication {
     return @{ ShortcutPath = $PinnedShortcutPath }
 }
 
+# True when Windows' application resolver answers here (it gives a shortcut to explorer.exe its
+# AppID) : an empty AppID then means Windows has none for the shortcut, not that it was not asked.
+$script:AppResolverAnswers = $null
+function Test-AppResolver {
+    if ($null -ne $script:AppResolverAnswers) { return $script:AppResolverAnswers }
+    $script:AppResolverAnswers = $false
+    try {
+        $ProbeShortcutPath = Get-TemporaryShortcutPath 'AppResolverProbe.lnk'
+        $WshShellComObject = New-Object -ComObject WScript.Shell
+        try {
+            $ProbeShortcut = $WshShellComObject.CreateShortcut($ProbeShortcutPath)
+            $ProbeShortcut.TargetPath = [IO.Path]::Combine($env:SystemRoot, 'explorer.exe')
+            $ProbeShortcut.Save()
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ProbeShortcut)
+        } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($WshShellComObject) }
+        if ([TaskbarPin]::GetShortcutAppId($ProbeShortcutPath)) { $script:AppResolverAnswers = $true }
+    } catch { }
+    if (-not $script:AppResolverAnswers) { Write-Log "  [appid] Windows' application resolver does not answer here : no AppID is written in a shortcut" 'Yellow' }
+    return $script:AppResolverAnswers
+}
+
+# Target path and arguments of a .lnk (empty for a shortcut to a shell item, or a file that
+# cannot be read).
+function Get-ShortcutTarget {
+    param([string]$ShortcutPath)
+    $WshShellComObject = New-Object -ComObject WScript.Shell
+    try {
+        $ShortcutObject = $WshShellComObject.CreateShortcut($ShortcutPath)
+        try { return @{ Path = [string]$ShortcutObject.TargetPath; Arguments = [string]$ShortcutObject.Arguments } }
+        finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShortcutObject) }
+    } catch { return @{ Path = ''; Arguments = '' } }
+    finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($WshShellComObject) }
+}
+
+# True when a shortcut starts a program (.exe, .com), whose AppID Windows computes itself.
+function Test-ProgramShortcut {
+    param([string]$ShortcutPath)
+    $TargetExtension = [IO.Path]::GetExtension((Get-ShortcutTarget $ShortcutPath).Path)
+    return $TargetExtension -eq '.exe' -or $TargetExtension -eq '.com'
+}
+
+# The AppID a shortcut is listed under when Windows gives it none : its target, with its
+# arguments (two shortcuts to control.exe are two items).
+function Get-ShortcutFallbackAppId {
+    param([string]$ShortcutPath)
+    $ShortcutTarget = Get-ShortcutTarget $ShortcutPath
+    if ($ShortcutTarget.Path -and $ShortcutTarget.Arguments) { return "$($ShortcutTarget.Path) $($ShortcutTarget.Arguments)" }
+    return $ShortcutTarget.Path
+}
+
+# Windows gives no AppID to a shortcut to a document, a script, a folder or some hosts
+# (control.exe), and lends the AppID a shortcut carries to every shortcut to the same item, the
+# pinned one included. The pinned shortcut therefore carries the AppID its pin is listed under,
+# as its own : the taskbar, which recomputes it when the shortcut changes, would otherwise find
+# none and drop the pin. A program whose AppID Windows computes keeps Windows' form. Returns
+# the shortcut to pin, a copy when the item given is a shortcut (the user's file is never
+# changed).
+function Set-SourceShortcutAppId {
+    param([string]$SourceShortcutPath, [string]$ItemPath, [string]$ApplicationId, [bool]$AppIdFromWindows, [string]$PinnedShortcutPath)
+    if (-not $ApplicationId -or [TaskbarPin]::GetAumid($SourceShortcutPath) -or -not (Test-AppResolver)) { return $SourceShortcutPath }
+    if ($AppIdFromWindows -and (Test-ProgramShortcut $SourceShortcutPath) -and -not ($PinnedShortcutPath -and [IO.File]::Exists($PinnedShortcutPath) -and
+        [string]::Equals([TaskbarPin]::GetAumid($PinnedShortcutPath), $ApplicationId, [StringComparison]::OrdinalIgnoreCase))) { return $SourceShortcutPath }
+    if ([string]::Equals($SourceShortcutPath, $ItemPath, [StringComparison]::OrdinalIgnoreCase)) {
+        $SourceShortcutCopyPath = Get-TemporaryShortcutPath ([IO.Path]::GetFileName($SourceShortcutPath))
+        [IO.File]::Copy($SourceShortcutPath, $SourceShortcutCopyPath)
+        $SourceShortcutPath = $SourceShortcutCopyPath
+    }
+    if (-not [TaskbarPin]::SetAumid($SourceShortcutPath, $ApplicationId)) { Write-Log "  [pin] AppID '$ApplicationId' could not be written in '$([IO.Path]::GetFileName($SourceShortcutPath))'" 'Yellow' }
+    return $SourceShortcutPath
+}
+
 # Path for the pinned .lnk of an application : the proposed one when it is free or holds this
 # application's shortcut, else ' (2)', ' (3)'..., as Windows names a new pin : a .lnk of
 # another application, or whose AppID cannot be read, is never written over.
@@ -1852,6 +1959,9 @@ function Get-AvailablePinnedShortcutPath {
     $CandidateShortcutPath = $ProposedShortcutPath
     for ($NameSuffix = 2; [IO.File]::Exists($CandidateShortcutPath); $NameSuffix++) {
         $ExistingApplicationId = [TaskbarPin]::GetShortcutAppId($CandidateShortcutPath)
+        # A shortcut pinned by an earlier version may carry no AppID Windows can read : the
+        # target path it was listed under then tells whose it is.
+        if (-not $ExistingApplicationId) { $ExistingApplicationId = Get-ShortcutFallbackAppId $CandidateShortcutPath }
         if ($ExistingApplicationId -and [string]::Equals($ExistingApplicationId, $ApplicationId, [StringComparison]::OrdinalIgnoreCase)) { break }
         $CandidateShortcutPath = [IO.Path]::Combine($ShortcutDirectory, "$ShortcutBaseName ($NameSuffix).lnk")
     }
@@ -1888,7 +1998,9 @@ function Repair-PinnedItems {
     if ($PinList.Count -eq 0) { Write-Log "    [repair] No pinned item"; return 0 }
     $RepairCount       = 0
     $SeenShortcutPaths = @{}
+    $SeenAppIds        = @{}
     $ShortcutsToReload = @()
+    $ShortcutsToDelete = @()
     $EntryIndex        = 0
     while ($EntryIndex -lt $PinList.Count) {
         $PinnedEntry = $PinList.GetEntry($EntryIndex)
@@ -1907,13 +2019,33 @@ function Repair-PinnedItems {
         }
         if ($PinnedShortcutPath) { $SeenShortcutPaths[$PinnedShortcutPath.ToLower()] = $true }
         $ExpectedAppId = ''
-        if ($IsOwnerSession -and $PinnedShortcutPath.EndsWith('.lnk', [StringComparison]::OrdinalIgnoreCase)) {
-            if (Update-PinnedShortcut $PinnedShortcutPath $null) {
+        if ($PinnedShortcutPath.EndsWith('.lnk', [StringComparison]::OrdinalIgnoreCase) -and [IO.File]::Exists($PinnedShortcutPath)) {
+            if ($IsOwnerSession -and (Update-PinnedShortcut $PinnedShortcutPath $null)) {
                 $RepairCount++
                 $ShortcutsToReload += $PinnedShortcutPath
                 Write-Log "    [repair] '$EntryLabel' : icon embedded in the pinned shortcut"
             }
-            $ExpectedAppId = [TaskbarPin]::GetShortcutAppId($PinnedShortcutPath)
+            $ShortcutAppId = [TaskbarPin]::GetShortcutAppId($PinnedShortcutPath)
+            if (-not [TaskbarPin]::GetAumid($PinnedShortcutPath) -and (-not $ShortcutAppId -or -not (Test-ProgramShortcut $PinnedShortcutPath)) -and (Test-AppResolver)) {
+                # Windows gives no AppID of its own to a shortcut to a document, a script, a
+                # folder or some hosts, only one lent by another shortcut to the same item : the
+                # taskbar drops such a pin when it reloads the shortcut (earlier versions had it
+                # reload them). The shortcut gets the AppID its entry is listed under, else the
+                # one Windows gives it, else its target's.
+                $FallbackAppId = $PreviousAppId
+                if (-not $FallbackAppId) { $FallbackAppId = $ShortcutAppId }
+                if (-not $FallbackAppId) { $FallbackAppId = Get-ShortcutFallbackAppId $PinnedShortcutPath }
+                $PreviousWriteTime = [IO.File]::GetLastWriteTimeUtc($PinnedShortcutPath)
+                if ($FallbackAppId -and [TaskbarPin]::SetAumid($PinnedShortcutPath, $FallbackAppId)) {
+                    if (([IO.File]::GetLastWriteTimeUtc($PinnedShortcutPath) - $PreviousWriteTime).TotalSeconds -lt 2) { [IO.File]::SetLastWriteTimeUtc($PinnedShortcutPath, $PreviousWriteTime.AddSeconds(2)) }
+                    $ShortcutAppId = [TaskbarPin]::GetShortcutAppId($PinnedShortcutPath)
+                    $RepairCount++
+                    $ShortcutsToReload += $PinnedShortcutPath
+                    Write-Log "    [repair] '$EntryLabel' : AppID '$ShortcutAppId' written in the pinned shortcut"
+                }
+            }
+            # In another user's list, the AppID Windows gives here is set only where the entry has none
+            if ($IsOwnerSession -or -not $PreviousAppId) { $ExpectedAppId = $ShortcutAppId }
         }
         $RepairedEntry = [TaskbarPin]::FixEntry($PinnedEntry, $ExpectedAppId)
         if ($RepairedEntry) {
@@ -1924,6 +2056,18 @@ function Repair-PinnedItems {
                 Write-Log "    [repair] '$EntryLabel' : AppID '$PreviousAppId' -> '$ExpectedAppId'"
             } else { Write-Log "    [repair] '$EntryLabel' : extension blocks repaired" }
         }
+        # A second active entry with the same AppID (an earlier version could leave one, named
+        # ' (2)') is removed, with its shortcut : the taskbar shows one button per AppID.
+        $EntryAppId = [TaskbarPin]::GetEntryAppId($PinList.GetEntry($EntryIndex))
+        if ($EntryAppId -and $SeenAppIds.ContainsKey($EntryAppId.ToLower())) {
+            $PinList.RemoveAt($EntryIndex)
+            $RepairCount++
+            if ($PinnedShortcutPath -and [IO.File]::Exists($PinnedShortcutPath)) { $ShortcutsToDelete += $PinnedShortcutPath }
+            $ShortcutsToReload = @($ShortcutsToReload | Where-Object { $_ -ne $PinnedShortcutPath })
+            Write-Log "    [repair] '$EntryLabel' removed (same AppID as '$($SeenAppIds[$EntryAppId.ToLower()])')" 'Yellow'
+            continue
+        }
+        if ($EntryAppId) { $SeenAppIds[$EntryAppId.ToLower()] = $EntryLabel }
         if (Set-EntryResolveRecord $PinList $EntryIndex $IsOwnerSession $OwnerTaskBarDirectory $true) {
             $RepairCount++
             Write-Log "    [repair] '$EntryLabel' : resolve record rebuilt"
@@ -1931,6 +2075,11 @@ function Repair-PinnedItems {
         $EntryIndex++
     }
     $PinListWasWritten = Save-TaskbandPinList $RegistryKeyHandle $PinListState
+    if ($PinListWasWritten) {
+        foreach ($ShortcutToDelete in $ShortcutsToDelete) {
+            try { [IO.File]::Delete($ShortcutToDelete) } catch { Write-Log "    [repair] '$([IO.Path]::GetFileName($ShortcutToDelete))' could not be deleted : $($_.Exception.Message)" 'Yellow' }
+        }
+    }
     if ($RepairCount -eq 0) { Write-Log "    [repair] Nothing to repair"; return 0 }
     if ($NotifyTaskbar) {
         if ($PinListWasWritten) { [TaskbarPin]::SendPinNotify() }
@@ -2373,6 +2522,8 @@ if (-not $TaskbarUsesQuickLaunch -and ($PrimaryUserHasPinList -or $AllUsers)) {
                 }
                 $SourceApplicationId = [TaskbarPin]::GetShortcutAppId($SourceShortcutPath)
                 if ($SourceApplicationId) { $Beef001dParsingName = $SourceApplicationId }
+            } else {
+                $SourceShortcutPath = Set-SourceShortcutAppId $SourceShortcutPath $PinTarget.ResolvedPath $Beef001dParsingName ([bool]$ResolvedApplicationId) ''
             }
             $BlobEntriesReadyForInjection += @{ ShortcutPath = $SourceShortcutPath; SerializedBlobEntry = $null; DisplayName = $ProposedShortcutName; Beef001dContent = $Beef001dParsingName }
             Write-Log "  [pin] Target : '$(if ($PinTarget.PinType -eq 'UWP') { $PinTarget.Aumid } else { $PinTarget.ResolvedPath })' | shortcut : '$ProposedShortcutName' | BEEF001D : '$Beef001dParsingName' | other profiles only"
@@ -2404,6 +2555,8 @@ if (-not $TaskbarUsesQuickLaunch -and ($PrimaryUserHasPinList -or $AllUsers)) {
                 Write-Log "  [uwp] CreateAppShortcut FAILED for '$($PinTarget.Aumid)' -- existing pin kept as is" 'Yellow'
                 $SourceShortcutPath = $null
             }
+        } else {
+            $SourceShortcutPath = Set-SourceShortcutAppId $SourceShortcutPath $PinTarget.ResolvedPath $Beef001dParsingName ([bool]$ResolvedApplicationId) $DestinationLnkPath
         }
         if ($DestinationLnkAlreadyPinned) { $ShortcutWasUpdated = Update-PinnedShortcut $DestinationLnkPath $SourceShortcutPath }
         elseif ($SourceShortcutPath -ne $DestinationLnkPath) { [IO.File]::Copy($SourceShortcutPath, $DestinationLnkPath) }

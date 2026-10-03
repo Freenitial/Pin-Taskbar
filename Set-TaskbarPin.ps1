@@ -1,5 +1,5 @@
 ﻿function Set-TaskbarPin {
-    # Version 1.6
+    # Version 1.7
     <#
         .EXAMPLE
         Set-TaskbarPin firefox
@@ -109,7 +109,7 @@
         $NativeHelperType = 'TaskbarPin' -as [Type]
         if ($NativeHelperType) {
             $HelperVersionField = $NativeHelperType.GetField('HelperVersion')
-            if (-not $HelperVersionField -or $HelperVersionField.GetValue($null) -ne '1.6') { throw 'This PowerShell session holds the helper of another Pin-Taskbar version : run the script in a new PowerShell session.' }
+            if (-not $HelperVersionField -or $HelperVersionField.GetValue($null) -ne '1.7') { throw 'This PowerShell session holds the helper of another Pin-Taskbar version : run the script in a new PowerShell session.' }
             return
         }
 Add-Type -TypeDefinition @'
@@ -118,7 +118,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 public class TaskbarPin {
-    public const string HelperVersion = "1.6";
+    public const string HelperVersion = "1.7";
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern IntPtr ILCreateFromPathW(string pszPath);
     [DllImport("shell32.dll")] static extern void ILFree(IntPtr pidl);
     [DllImport("shell32.dll")] static extern IntPtr ILFindLastID(IntPtr pidl);
@@ -239,14 +239,15 @@ public class TaskbarPin {
             } finally { Marshal.FreeCoTaskMem(strPtr); Marshal.FreeCoTaskMem(pvPtr); Marshal.FreeCoTaskMem(pkPtr); }
         } finally { Release(pps); }
     }
-    static bool PersistLoad(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, false); }
-    static bool PersistSave(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, true); }
-    static bool PersistFile(IntPtr psl, IntPtr vtLink, string lnkPath, bool save) {
+    static bool PersistLoad(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, false, 0); }
+    static bool PersistLoadWritable(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, false, 2); }
+    static bool PersistSave(IntPtr psl, IntPtr vtLink, string lnkPath) { return PersistFile(psl, vtLink, lnkPath, true, 0); }
+    static bool PersistFile(IntPtr psl, IntPtr vtLink, string lnkPath, bool save, uint loadMode) {
         Guid iid = IID_IPersistFile; IntPtr ppf;
         if (Vtbl<FnQueryInterface>(vtLink, 0)(psl, ref iid, out ppf) != 0) return false;
         try {
             IntPtr pathPtr = Marshal.StringToCoTaskMemUni(lnkPath);
-            try { return (save ? Slot<FnSaveFile>(ppf, 6)(ppf, pathPtr, 1) : Slot<FnLoadFile>(ppf, 5)(ppf, pathPtr, 0)) == 0; }
+            try { return (save ? Slot<FnSaveFile>(ppf, 6)(ppf, pathPtr, 1) : Slot<FnLoadFile>(ppf, 5)(ppf, pathPtr, loadMode)) == 0; }
             finally { Marshal.FreeCoTaskMem(pathPtr); }
         } finally { Release(ppf); }
     }
@@ -720,10 +721,36 @@ public class TaskbarPin {
             } finally { Release(psl, vtLink); }
         });
     }
+    public static bool SetAumid(string lnkPath, string aumid) {
+        return RunOnSTA<bool>(delegate() {
+            string savedPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".lnk");
+            try {
+                Guid cls = CLSID_ShellLink; Guid iid = IID_IShellLinkW; IntPtr psl;
+                if (CoCreateInstance(ref cls, IntPtr.Zero, 1, ref iid, out psl) != 0) return false;
+                IntPtr vtLink = Marshal.ReadIntPtr(psl);
+                bool saved;
+                try { saved = PersistLoadWritable(psl, vtLink, lnkPath) && WriteAumidToStore(psl, vtLink, aumid) && PersistSave(psl, vtLink, savedPath); }
+                finally { Release(psl, vtLink); }
+                if (saved) WriteInPlace(lnkPath, System.IO.File.ReadAllBytes(savedPath));
+                return saved;
+            } finally { try { System.IO.File.Delete(savedPath); } catch { } }
+        });
+    }
+    [DllImport("kernel32.dll")] static extern uint GetACP();
+    static System.Text.Encoding ansiEncoding;
+    static System.Text.Encoding Ansi {
+        get {
+            if (ansiEncoding == null) {
+                try { ansiEncoding = System.Text.Encoding.GetEncoding((int)GetACP()); }
+                catch { ansiEncoding = System.Text.Encoding.Default; }
+            }
+            return ansiEncoding;
+        }
+    }
     static string ReadAnsiZ(byte[] d, int pos) {
         int end = pos;
         while (end < d.Length && d[end] != 0) end++;
-        return System.Text.Encoding.Default.GetString(d, pos, end - pos);
+        return Ansi.GetString(d, pos, end - pos);
     }
     static string ReadUniZ(byte[] d, int pos) {
         int end = pos;
@@ -789,11 +816,11 @@ public class TaskbarPin {
             if (pos + 2 + byteCount > d.Length) return;
             if (stringDataFlags[i] == 0x08) {
                 relativePath = isUnicode ? System.Text.Encoding.Unicode.GetString(d, pos + 2, byteCount)
-                                         : System.Text.Encoding.Default.GetString(d, pos + 2, byteCount);
+                                         : Ansi.GetString(d, pos + 2, byteCount);
             }
             else if (stringDataFlags[i] == 0x40) {
                 iconPath = isUnicode ? System.Text.Encoding.Unicode.GetString(d, pos + 2, byteCount)
-                                     : System.Text.Encoding.Default.GetString(d, pos + 2, byteCount);
+                                     : Ansi.GetString(d, pos + 2, byteCount);
             }
             pos += 2 + byteCount;
         }
@@ -1242,12 +1269,9 @@ public class TaskbandPinList {
         $TargetFileExtension = [IO.Path]::GetExtension($ResolvedTargetPath).ToLower()
         if (-not $WshShellComObjectRef.Value) { $WshShellComObjectRef.Value = New-Object -ComObject WScript.Shell }
         if ($TargetFileExtension -eq '.lnk') {
-            $ShortcutObject = $WshShellComObjectRef.Value.CreateShortcut($ResolvedTargetPath)
-            $ShortcutTargetPath = $ShortcutObject.TargetPath
-            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShortcutObject)
             $ShortcutAppUserModelId = ''
             if ('TaskbarPin' -as [Type]) { $ShortcutAppUserModelId = [TaskbarPin]::GetAumid($ResolvedTargetPath) }
-            if ($ShortcutAppUserModelId) { $Beef001dContentRef.Value = $ShortcutAppUserModelId } else { $Beef001dContentRef.Value = $ShortcutTargetPath }
+            if ($ShortcutAppUserModelId) { $Beef001dContentRef.Value = $ShortcutAppUserModelId } else { $Beef001dContentRef.Value = Get-ShortcutFallbackAppId $ResolvedTargetPath }
             return $ResolvedTargetPath
         }
         if ($TargetFileExtension -eq '.cpl') {
@@ -1411,6 +1435,57 @@ public class TaskbandPinList {
         if (-not ($PinnedShortcutPath.EndsWith('.lnk', [StringComparison]::OrdinalIgnoreCase) -and [string]::Equals([IO.Path]::GetDirectoryName($PinnedShortcutPath), $TaskBarPinnedDirectory, [StringComparison]::OrdinalIgnoreCase))) { $PinnedShortcutPath = '' }
         return @{ ShortcutPath = $PinnedShortcutPath }
     }
+    $script:AppResolverAnswers = $null
+    function Test-AppResolver {
+        if ($null -ne $script:AppResolverAnswers) { return $script:AppResolverAnswers }
+        $script:AppResolverAnswers = $false
+        try {
+            $ProbeShortcutPath = Get-TemporaryShortcutPath 'AppResolverProbe.lnk'
+            $WshShellComObject = New-Object -ComObject WScript.Shell
+            try {
+                $ProbeShortcut = $WshShellComObject.CreateShortcut($ProbeShortcutPath)
+                $ProbeShortcut.TargetPath = [IO.Path]::Combine($env:SystemRoot, 'explorer.exe')
+                $ProbeShortcut.Save()
+                [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ProbeShortcut)
+            } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($WshShellComObject) }
+            if ([TaskbarPin]::GetShortcutAppId($ProbeShortcutPath)) { $script:AppResolverAnswers = $true }
+        } catch { }
+        return $script:AppResolverAnswers
+    }
+    function Get-ShortcutTarget {
+        param([string]$ShortcutPath)
+        $WshShellComObject = New-Object -ComObject WScript.Shell
+        try {
+            $ShortcutObject = $WshShellComObject.CreateShortcut($ShortcutPath)
+            try { return @{ Path = [string]$ShortcutObject.TargetPath; Arguments = [string]$ShortcutObject.Arguments } }
+            finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ShortcutObject) }
+        } catch { return @{ Path = ''; Arguments = '' } }
+        finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($WshShellComObject) }
+    }
+    function Test-ProgramShortcut {
+        param([string]$ShortcutPath)
+        $TargetExtension = [IO.Path]::GetExtension((Get-ShortcutTarget $ShortcutPath).Path)
+        return $TargetExtension -eq '.exe' -or $TargetExtension -eq '.com'
+    }
+    function Get-ShortcutFallbackAppId {
+        param([string]$ShortcutPath)
+        $ShortcutTarget = Get-ShortcutTarget $ShortcutPath
+        if ($ShortcutTarget.Path -and $ShortcutTarget.Arguments) { return "$($ShortcutTarget.Path) $($ShortcutTarget.Arguments)" }
+        return $ShortcutTarget.Path
+    }
+    function Set-SourceShortcutAppId {
+        param([string]$SourceShortcutPath, [string]$ItemPath, [string]$ApplicationId, [bool]$AppIdFromWindows, [string]$PinnedShortcutPath)
+        if (-not $ApplicationId -or [TaskbarPin]::GetAumid($SourceShortcutPath) -or -not (Test-AppResolver)) { return $SourceShortcutPath }
+        if ($AppIdFromWindows -and (Test-ProgramShortcut $SourceShortcutPath) -and -not ($PinnedShortcutPath -and [IO.File]::Exists($PinnedShortcutPath) -and
+            [string]::Equals([TaskbarPin]::GetAumid($PinnedShortcutPath), $ApplicationId, [StringComparison]::OrdinalIgnoreCase))) { return $SourceShortcutPath }
+        if ([string]::Equals($SourceShortcutPath, $ItemPath, [StringComparison]::OrdinalIgnoreCase)) {
+            $SourceShortcutCopyPath = Get-TemporaryShortcutPath ([IO.Path]::GetFileName($SourceShortcutPath))
+            [IO.File]::Copy($SourceShortcutPath, $SourceShortcutCopyPath)
+            $SourceShortcutPath = $SourceShortcutCopyPath
+        }
+        $null = [TaskbarPin]::SetAumid($SourceShortcutPath, $ApplicationId)
+        return $SourceShortcutPath
+    }
     function Get-AvailablePinnedShortcutPath {
         param([string]$ProposedShortcutPath, [string]$ApplicationId)
         $ShortcutDirectory     = [IO.Path]::GetDirectoryName($ProposedShortcutPath)
@@ -1418,6 +1493,7 @@ public class TaskbandPinList {
         $CandidateShortcutPath = $ProposedShortcutPath
         for ($NameSuffix = 2; [IO.File]::Exists($CandidateShortcutPath); $NameSuffix++) {
             $ExistingApplicationId = [TaskbarPin]::GetShortcutAppId($CandidateShortcutPath)
+            if (-not $ExistingApplicationId) { $ExistingApplicationId = Get-ShortcutFallbackAppId $CandidateShortcutPath }
             if ($ExistingApplicationId -and [string]::Equals($ExistingApplicationId, $ApplicationId, [StringComparison]::OrdinalIgnoreCase)) { break }
             $CandidateShortcutPath = [IO.Path]::Combine($ShortcutDirectory, "$ShortcutBaseName ($NameSuffix).lnk")
         }
@@ -1723,6 +1799,8 @@ public class TaskbandPinList {
                         if (-not [TaskbarPin]::CreateAppShortcut($PinTarget.Aumid, $SourceShortcutPath)) { $FailedPinNames += $PinTargetDisplayName; continue }
                         $SourceApplicationId = [TaskbarPin]::GetShortcutAppId($SourceShortcutPath)
                         if ($SourceApplicationId) { $Beef001dParsingName = $SourceApplicationId }
+                    } else {
+                        $SourceShortcutPath = Set-SourceShortcutAppId $SourceShortcutPath $PinTarget.ResolvedPath $Beef001dParsingName ([bool]$ResolvedApplicationId) ''
                     }
                     $BlobEntriesReadyForInjection += @{ ShortcutPath = $SourceShortcutPath; SerializedBlobEntry = $null; DisplayName = $ProposedShortcutName; Beef001dContent = $Beef001dParsingName }
                     continue
@@ -1742,6 +1820,8 @@ public class TaskbandPinList {
                         }
                         $SourceShortcutPath = $null
                     }
+                } else {
+                    $SourceShortcutPath = Set-SourceShortcutAppId $SourceShortcutPath $PinTarget.ResolvedPath $Beef001dParsingName ([bool]$ResolvedApplicationId) $DestinationLnkPath
                 }
                 if ($DestinationLnkAlreadyPinned) { $ShortcutWasUpdated = Update-PinnedShortcut $DestinationLnkPath $SourceShortcutPath }
                 elseif ($SourceShortcutPath -ne $DestinationLnkPath) { [IO.File]::Copy($SourceShortcutPath, $DestinationLnkPath) }

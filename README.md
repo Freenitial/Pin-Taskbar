@@ -17,7 +17,7 @@ Every other taskbar pin tool either:
 This tool writes directly to the taskbar's internal data structures with proper synchronization, producing results indistinguishable from a native pin operation. No restart, no flicker, instant.
 
 Starting with v1.6, the behavior is now identical to Windows (99% certain).
-Even better: you can pin **anything**, including what Explorer itself refuses to pin (any file, folder, Control Panel applet `.cpl`, console `.msc`, etc.).
+Even better: you can pin **anything**, including what Explorer itself refuses to pin (any file, folder, Control Panel applet `.cpl`, console `.msc`, etc.). Since v1.7, these pins also survive being updated.
 If you have used a previous version, it is recommended that you run `Pin-Taskbar.ps1 -Repair`.
 
 
@@ -123,7 +123,7 @@ Set-TaskbarPin "C:\Windows\System32\main.cpl" -Silent
 |---|---|---|
 | `-Pin` | `-Path`, `-File`, `-Files` | First positional argument. Path(s) to pin: `.lnk`, `.exe`, `.msc`, `.cpl`, directories, application names, UWP AUMIDs. Semicolon-delimited (`;;` for a semicolon inside an item), wildcards supported. A bare name pins one application (exact display name first); a wildcard pins every match. |
 | `-Unpin` | `-Remove` | Switch. Turns `-Pin` into a match pattern for removal. |
-| `-Repair` | `-Fix` | Switch. Checks every pinned item and repairs the malformed ones (extension blocks, AppID, resolve records, entries whose shortcut is gone or listed twice). Can be combined with `-Pin` or `-Unpin`. Standalone scripts only. |
+| `-Repair` | `-Fix` | Switch. Checks every pinned item and repairs the malformed ones (extension blocks, AppID, resolve records, entries whose shortcut is gone or listed twice, a second pin of the same application), and the pins earlier versions left fragile or damaged. Can be combined with `-Pin` or `-Unpin`. Standalone scripts only. |
 | `-Silent` | `-S` | Suppresses console output. The log file is not affected. |
 | `-LogFile` | `-Log` | Path to a `.txt` or `.log` file for detailed logging. Standalone scripts only. |
 | `-AllUsers` | `-Everyone`, `-All` | Applies the operation to every user profile and to the Default profile (users created later). Requires elevation; also works from the SYSTEM account (deployment tools, startup scripts). |
