@@ -2,7 +2,7 @@
 
 Pin or unpin items to the Windows taskbar.
 
-Tested **from Windows Vista to Windows 11 25H2** (Build 26200+).
+Tested **from Windows Vista to Windows 11 26H2** (Build 26300.9550+).
 
 ---
 
